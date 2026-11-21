@@ -8,7 +8,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 
 import config
-from gemini_client import extract_people
+from llm_client import extract_people
 from normalizer import build_block
 
 logging.basicConfig(
@@ -70,8 +70,11 @@ async def on_text(m: Message):
     try:
         people = await extract_people(text)
     except Exception as e:
-        log.exception("Gemini call failed")
-        await m.answer(f"⚠️ Ошибка при обращении к LLM:\n{e}")
+        log.exception("LLM call failed")
+        await m.answer(
+            "⏳ LLM сейчас недоступна или перегружена. Попробуй ещё раз через минуту.\n\n"
+            f"<code>{type(e).__name__}: {str(e)[:200]}</code>"
+        )
         return
 
     if not people:
@@ -90,7 +93,8 @@ async def main():
         config.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    log.info("Бот запущен, модель: %s", config.GEMINI_MODEL)
+    log.info("Бот запущен, провайдер: %s, модели: %s",
+             config.LLM_BASE_URL, config.LLM_MODELS)
     await dp.start_polling(bot)
 
 
