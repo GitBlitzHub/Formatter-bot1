@@ -18,8 +18,7 @@ _UK_POSTCODE = re.compile(
 )
 
 _pc_cache: dict[str, bool | None] = {}
-_house_cache: dict[str, bool | None] = {}    # ключ: POSTCODE|HOUSE
-_street_cache: dict[str, bool | None] = {}   # ключ: POSTCODE
+_find_cache: dict[str, list[str] | None] = {}   # ключ: POSTCODE -> список адресов
 _lock = asyncio.Lock()
 
 
@@ -71,6 +70,7 @@ async def _verify_postcode(postcode: str) -> bool | None:
         return None
 
     res = True if r.status_code == 200 else (False if r.status_code == 404 else None)
+    log.info("postcodes.io %s -> %s", key, res)
     async with _lock:
         _pc_cache[key] = res
     return res
@@ -82,73 +82,81 @@ class _Limited(Exception):
     """Исчерпан бесплатный лимит."""
 
 
-async def _ga_get(path: str) -> list[str] | None:
-    """GET к getAddress.io. Список адресов, None — API лёг."""
+async def _ga_find(postcode: str) -> list[str] | None:
+    """Все адреса по посткоду через /find. None — API лёг/лимит."""
     if not config.GETADDRESS_API_KEY:
         return None
-    try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
-            r = await c.get(
-                f"{_GETADDRESS}{path}",
-                params={"api-key": config.GETADDRESS_API_KEY},
-            )
-    except Exception as e:
-        log.warning("getAddress.io: %s", e)
-        return None
 
-    if r.status_code == 429:
-        log.warning("getAddress.io: лимит исчерпан")
-        raise _Limited()
-    if r.status_code == 401:
-        log.warning("getAddress.io: неверный GETADDRESS_API_KEY")
-        return None
-    if r.status_code == 404:
-        return []
-    if r.status_code != 200:
-        log.warning("getAddress.io вернул %s", r.status_code)
-        return None
-
-    try:
-        return r.json().get("addresses") or []
-    except Exception:
-        return None
-
-
-async def _check_house(postcode: str, house: str) -> bool | None:
-    """Точечная проверка дома через /get/{postcode}/{house}. None — не смогли."""
-    key = f"{postcode.replace(' ', '').upper()}|{house.upper()}"
-    async with _lock:
-        if key in _house_cache:
-            return _house_cache[key]
-
-    addrs = await _ga_get(f"/get/{postcode}/{house}")
-    if addrs is None:
-        return None
-
-    res = len(addrs) > 0
-    async with _lock:
-        _house_cache[key] = res
-    log.info("getAddress /get %s/%s -> %s", postcode, house, res)
-    return res
-
-
-async def _check_street(postcode: str, street: str) -> bool | None:
-    """Проверка улицы через /find/{postcode}. None — не смогли."""
     key = postcode.replace(" ", "").upper()
     async with _lock:
-        if key in _street_cache:
-            return _street_cache[key]
+        if key in _find_cache:
+            return _find_cache[key]
 
-    addrs = await _ga_get(f"/find/{postcode}")
-    if addrs is None:
-        return None
+    # пробуем и без пробела, и с пробелом — у getAddress разные сборки
+    for pc in {key, postcode.strip().upper()}:
+        try:
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
+                r = await c.get(
+                    f"{_GETADDRESS}/find/{pc}",
+                    params={"api-key": config.GETADDRESS_API_KEY, "expand": "true"},
+                )
+        except Exception as e:
+            log.warning("getAddress.io: %s", e)
+            return None
 
+        if r.status_code == 429:
+            log.warning("getAddress.io: лимит исчерпан")
+            raise _Limited()
+        if r.status_code == 401:
+            log.warning("getAddress.io: неверный GETADDRESS_API_KEY")
+            return None
+        if r.status_code == 404:
+            async with _lock:
+                _find_cache[key] = []
+            return []
+        if r.status_code != 200:
+            log.warning("getAddress.io вернул %s на %s", r.status_code, pc)
+            continue
+
+        try:
+            body = r.json()
+        except Exception:
+            log.warning("getAddress.io: не JSON: %s", r.text[:200])
+            continue
+
+        if isinstance(body, dict) and body.get("Message"):
+            log.warning("getAddress.io сообщение: %s", body.get("Message"))
+            return None
+
+        addrs = body.get("addresses") or []
+
+        # addresses могут быть строками или объектами (при expand=true)
+        flat: list[str] = []
+        for a in addrs:
+            if isinstance(a, str):
+                flat.append(a)
+            elif isinstance(a, dict):
+                flat.append(a.get("formatted_address") or " ".join(
+                    str(a.get(k, "")).strip()
+                    for k in ("line_1", "line_2", "line_3", "line_4", "postcode")
+                ).strip())
+
+        log.info("getAddress /find %s -> %d адресов", pc, len(flat))
+        async with _lock:
+            _find_cache[key] = flat
+        return flat
+
+    return None
+
+
+def _house_in(addresses: list[str], house: str) -> bool:
+    pat = re.compile(rf"(?:^|\s){re.escape(house)}\b", re.IGNORECASE)
+    return any(pat.search(a or "") for a in addresses)
+
+
+def _street_in(addresses: list[str], street: str) -> bool:
     want = _norm(street)
-    res = any(want in _norm(a) for a in addrs)
-    async with _lock:
-        _street_cache[key] = res
-    log.info("getAddress /find %s street=%s -> %s", postcode, street, res)
-    return res
+    return any(want in _norm(a) for a in addresses)
 
 
 # ---------------- главная ----------------
@@ -174,19 +182,24 @@ async def verify_full_address(address: str) -> bool | None:
     if not config.GETADDRESS_API_KEY:
         return True if pc_ok is True else None
 
+    try:
+        addrs = await _ga_find(pc)
+    except _Limited:
+        return None
+
+    if addrs is None:                      # getAddress лёг
+        return True if pc_ok is True else None
+    if not addrs:                          # посткод есть, но адресов нет
+        return False
+
     house = _house(address)
     street = _street(address)
 
-    try:
-        if house:
-            res = await _check_house(pc, house)
-            if res is not None:
-                return res
-        if street:
-            res = await _check_street(pc, street)
-            if res is not None:
-                return res
-    except _Limited:
-        return None
+    if house and _house_in(addrs, house):
+        return True
+    if street and _street_in(addrs, street):
+        return True
+    if house or street:
+        return False
 
     return True if pc_ok is True else None

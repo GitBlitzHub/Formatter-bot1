@@ -8,7 +8,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 
 import config
-from address_check import verify_full_address
+from address_check import verify_full_address, extract_postcode
 from llm_client import extract_people
 from normalizer import build_block, normalize_address
 
@@ -25,6 +25,7 @@ HELP = (
     "Можно кидать как одну запись, так и несколько подряд — разделю и обработаю каждую.\n\n"
     "Команды:\n"
     "/id — узнать свой telegram user_id\n"
+    "/check <адрес> — проверить адрес вручную\n"
     "/help — эта справка"
 )
 
@@ -54,6 +55,19 @@ async def cmd_help(m: Message):
 @dp.message(Command("id"))
 async def cmd_id(m: Message):
     await m.answer(f"Ваш user_id: <code>{m.from_user.id}</code>")
+
+
+@dp.message(Command("check"))
+async def cmd_check(m: Message):
+    addr = (m.text or "").replace("/check", "", 1).strip()
+    if not addr:
+        await m.answer("Пришли так: <code>/check 63 Matthysens Way, Cardiff, CF3 0PL</code>")
+        return
+
+    pc = extract_postcode(addr)
+    ok = await verify_full_address(addr)
+    verdict = {True: "✅ подтверждён", False: "❌ не найден", None: "⚠️ API лёг"}.get(ok, "?")
+    await m.answer(f"Посткод: <code>{pc or '—'}</code>\nРезультат: {verdict}")
 
 
 @dp.message(F.text)
