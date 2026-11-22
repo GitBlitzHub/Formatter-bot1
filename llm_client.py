@@ -1,58 +1,97 @@
-"""Генерация номера UK DL, если его нет во входных данных."""
-from __future__ import annotations
-
+import asyncio
+import json
+import logging
+import random
 import re
 
-ALPHA23 = "ABCDEFGHJKLMNPRSTUVWXYZ"  # 23 буквы (без I, O, Q)
+from openai import AsyncOpenAI
+
+import config
+from schemas import Extraction, Person
+from prompts import SYSTEM_PROMPT, JSON_REQUEST
+
+log = logging.getLogger("llm")
+
+_client = AsyncOpenAI(
+    base_url=config.LLM_BASE_URL,
+    api_key=config.LLM_API_KEY,
+    timeout=60.0,
+)
+
+_SYSTEM = SYSTEM_PROMPT + "\n\n" + JSON_REQUEST
+
+_RETRYABLE = {408, 409, 429, 500, 502, 503, 504}
+_MAX_ATTEMPTS = 4
+_BASE_DELAY = 1.5
 
 
-def ebcdic_code(ch: str) -> int:
-    """Возвращает код символа A-Z или 0-9 в таблице EBCDIC."""
-    if 'A' <= ch <= 'I':
-        return 193 + (ord(ch) - ord('A'))
-    elif 'J' <= ch <= 'R':
-        return 209 + (ord(ch) - ord('J'))
-    elif 'S' <= ch <= 'Z':
-        return 226 + (ord(ch) - ord('S'))
-    elif '0' <= ch <= '9':
-        return 240 + (ord(ch) - ord('0'))
-    raise ValueError(f"Недопустимый символ: {ch}")
+def _status_of(exc: Exception) -> int | None:
+    for attr in ("status_code", "code", "http_status"):
+        v = getattr(exc, attr, None)
+        if isinstance(v, int):
+            return v
+    m = re.search(r"\b(408|409|429|500|502|503|504)\b", str(exc))
+    return int(m.group(1)) if m else None
 
 
-def compute_check_letters(prefix14: str) -> str:
-    """Вычисляет 2 контрольные буквы по 14-символьному префиксу."""
-    prefix14 = prefix14.strip().upper()
-    if len(prefix14) != 14:
-        raise ValueError("prefix14 должен быть длиной 14")
-    s = sum((15 - i) * ebcdic_code(c) for i, c in enumerate(prefix14))
-    v = (-s) % 523
-    return ALPHA23[v % 23] + ALPHA23[v // 23]
+def _extract_json(text: str) -> dict | None:
+    text = (text or "").strip()
+    text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    m = re.search(r"\{.*\}", text, re.S)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None
+    return None
 
 
-def _surname5(surname: str) -> str:
-    s = re.sub(r"[^A-Za-z]", "", surname or "").upper()
-    if s.startswith("MC"):
-        s = "MAC" + s[2:]
-    return (s + "99999")[:5]
+async def _call_once(model: str, raw_text: str) -> str:
+    resp = await _client.chat.completions.create(
+        model=model,
+        temperature=0.1,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": _SYSTEM},
+            {"role": "user", "content": raw_text},
+        ],
+    )
+    return resp.choices[0].message.content or ""
 
 
-def _initial(name: str) -> str:
-    m = re.search(r"[A-Za-z]", name or "")
-    return m.group(0).upper() if m else "9"
+async def extract_people(raw_text: str) -> list[Person]:
+    last_exc: Exception | None = None
 
+    for model in config.LLM_MODELS:
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            try:
+                raw = await _call_once(model, raw_text)
+                data = _extract_json(raw)
 
-def generate_dl(surname: str, first: str, middle: str, dob: str, gender: str) -> str:
-    """dob = дд.мм.гггг, gender = M/F. Возвращает 16 символов или "" если данных мало."""
-    m = re.fullmatch(r"\s*(\d{1,2})\D(\d{1,2})\D(\d{4})\s*", dob or "")
-    if not m or gender not in ("M", "F") or not _surname5(surname).strip("9"):
-        return ""
-    day, month, year = int(m[1]), int(m[2]), int(m[3])
-    if not (1 <= day <= 31 and 1 <= month <= 12):
-        return ""
-    if gender == "F":
-        month += 50
-    first_tok = _initial(first)
-    mid_tok = _initial(middle)
-    prefix = (f"{_surname5(surname)}{str(year)[2]}{month:02d}{day:02d}{str(year)[3]}"
-              f"{first_tok}{mid_tok}9")
-    return prefix + compute_check_letters(prefix)
+                if not data:
+                    log.warning("[%s] не распарсил: %s", model, raw[:400])
+                    return []
+
+                extraction = Extraction(**data)
+                if model != config.LLM_MODELS[0]:
+                    log.info("Ответ получен с фолбэк-модели: %s", model)
+                return extraction.people
+
+            except Exception as e:
+                last_exc = e
+                code = _status_of(e)
+
+                if code not in _RETRYABLE or attempt == _MAX_ATTEMPTS:
+                    log.warning("[%s] сдаюсь (code=%s): %s", model, code, e)
+                    break
+
+                delay = _BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 0.7)
+                log.info("[%s] %s, повтор через %.1fs (%d/%d)",
+                         model, code, delay, attempt, _MAX_ATTEMPTS)
+                await asyncio.sleep(delay)
+
+    raise RuntimeError(f"Все модели недоступны: {last_exc}") from last_exc
