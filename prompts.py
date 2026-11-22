@@ -35,12 +35,13 @@ SYSTEM_PROMPT = """
    Сохраняй символы как есть, включая пробел перед номером выпуска,
    приведи к верхнему регистру, лишние пробелы убери. Если нет — "".
 
-8. address — адрес ОДНОЙ строкой в формате Royal Mail:
-   "<номер дома и улица>, <город/населённый пункт>, <ПОСТКОД>"
+8. address — адрес ОДНОЙ строкой. Сохрани ВСЕ части, что есть в тексте,
+   по порядку: "<дом и улица>, <район/пригород>, <город>, <ПОСТКОД>"
+   - Район/пригород НЕ ВЫКИДЫВАЙ. "St. Mellons (Trowbridge)" — оставь как есть.
    - Посткод ВСЕГДА ЗАГЛАВНЫМИ и В КОНЦЕ строки.
    - Названия улиц и города — в обычном регистре (Title Case).
    - Убери из конца страну: "United Kingdom", "UK", "England", "Great Britain".
-   - Убери дубли запятых и лишние пробелы.
+   - Если у адреса нет посткода — всё равно верни адрес.
    - Если адреса нет — "".
 
 ВАЖНО:
@@ -62,6 +63,12 @@ SYSTEM_PROMPT = """
 {"people":[{"title":"Dr","gender":"M","first_name":"Michael","middle_names":"",
 "last_name":"Van Der Berg","dob":"18.11.1967","dl_number":"",
 "address":"12A Fleet Street, London, EC4Y 1AA"}]}
+
+Ввод:
+"63 Matthysens Way, St. Mellons (Trowbridge), Cardiff, CF3 0PL"
+Вывод:
+{"people":[{"title":"","gender":"U","first_name":"","middle_names":"","last_name":"",
+"dob":"","dl_number":"","address":"63 Matthysens Way, St. Mellons (Trowbridge), Cardiff, CF3 0PL"}]}
 """.strip()
 
 

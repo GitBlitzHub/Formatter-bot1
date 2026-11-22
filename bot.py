@@ -8,8 +8,9 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 
 import config
+from address_check import verify_full_address
 from llm_client import extract_people
-from normalizer import build_block
+from normalizer import build_block, normalize_address
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,7 +82,18 @@ async def on_text(m: Message):
         await m.answer("🤷 Ничего не нашёл. Попробуй прислать текст ещё раз.")
         return
 
-    blocks = [build_block(p) for p in people]
+    blocks = []
+    for p in people:
+        addr = normalize_address(p.address or "")
+
+        if not addr:
+            final_addr = ""
+        else:
+            ok = await verify_full_address(addr)
+            final_addr = "(Ошибка)" if ok is False else addr
+
+        blocks.append(build_block(p, address_override=final_addr))
+
     out = "\n\n———————————\n\n".join(blocks)
 
     for chunk in _chunks(out):

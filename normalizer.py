@@ -31,13 +31,13 @@ _WORD_RE = re.compile(r"^[A-Za-z][A-Za-z'\-\.]*$")
 
 
 def _smart_title(text: str) -> str:
-    """Аккуратно приводит к Title Case, не ломая цифры и посткоды."""
+    """Title Case, не ломая цифры, посткоды и скобки."""
     out = []
     for w in (text or "").split():
-        if _WORD_RE.match(w) and (w.isupper() or w.islower()):
-            out.append(w.title())
-        else:
-            out.append(w)
+        core = w.strip("()")
+        if _WORD_RE.match(core) and (core.isupper() or core.islower()):
+            w = w.replace(core, core.title())
+        out.append(w)
     return " ".join(out)
 
 
@@ -105,7 +105,6 @@ def normalize_dob(raw: str) -> str:
 
         day, mon, year = a, b, _fix_year(c)
 
-        # если второе число не может быть месяцем -> это mm/dd
         if mon > 12 and day <= 12:
             day, mon = mon, day
 
@@ -113,7 +112,6 @@ def normalize_dob(raw: str) -> str:
         if r:
             return r
 
-        # fallback: вдруг это mm/dd/yyyy
         r = _fmt(a, b, year) or _fmt(b, a, year)
         if r:
             return r
@@ -125,7 +123,6 @@ def normalize_dob(raw: str) -> str:
         if r:
             return r
 
-    # не распознали — отдаём как есть, чтобы было видно
     return s
 
 
@@ -165,7 +162,7 @@ def normalize_address(raw: str) -> str:
 
 # ---------- сборка блока ----------
 
-def build_block(p: Person) -> str:
+def build_block(p: Person, address_override: str | None = None) -> str:
     title = _clean_title(p.title)
     if not title and p.gender in _GENDER_TITLE:
         title = _GENDER_TITLE[p.gender]
@@ -176,7 +173,11 @@ def build_block(p: Person) -> str:
     last_name = _smart_title(p.last_name).upper() if p.last_name else ""
     dob = normalize_dob(p.dob)
     dl = re.sub(r"\s+", " ", (p.dl_number or "").strip()).upper()
-    addr = normalize_address(p.address)
+
+    if address_override is not None:
+        addr = address_override
+    else:
+        addr = normalize_address(p.address)
 
     return (
         f"FIRST NAME: {first_name}\n"
