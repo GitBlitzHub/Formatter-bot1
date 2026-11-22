@@ -4,15 +4,6 @@ SYSTEM_PROMPT = """
 На вход приходит неструктурированный текст. В нём может быть ОДНА или НЕСКОЛЬКО
 записей о разных людях. Извлеки КАЖДУЮ запись и верни JSON по схеме.
 
-ПОРЯДОК ИМЁН В UK (КРИТИЧНО):
-ФИО почти всегда записывается как <Титул> <Имя> <Средние имена> <ФАМИЛИЯ>.
-ФАМИЛИЯ — ПОСЛЕДНЕЕ слово в группе имени перед датой рождения, адресом
-или другим не-именным полем.
-  "MR JAMES RICHARD LAW"        -> first=James, middle=Richard, last=Law
-  "Miss Bethany Norman-Walker"  -> first=Bethany, middle="", last=Norman-Walker
-  "Mr Stewart Trevor Barnes"    -> first=Stewart, middle=Trevor, last=Barnes
-Если стоит дата/адрес — фамилия берётся слева от них, НЕ из середины.
-
 ЖЁСТКИЕ ПРАВИЛА:
 
 1. title — титул/обращение, если он есть в тексте. Приведи к одному из:
@@ -26,11 +17,11 @@ SYSTEM_PROMPT = """
 
 3. first_name — ТОЛЬКО первое имя. Без титула, без фамилии, без средних имён.
 
-4. middle_names — средние имена между первым и фамилией, через пробел.
+4. middle_names — все средние имена и/или инициалы, как есть, через пробел.
    Если их нет — "".
 
-5. last_name — ТОЛЬКО фамилия (последнее имя в группе). Составные фамилии
-   ("Van Der Berg", "O'Brien-Smith", "Norman-Walker") сохраняй целиком.
+5. last_name — ТОЛЬКО фамилия. Если фамилия составная ("Van Der Berg",
+   "De La Cruz", "O'Brien-Smith") — сохрани её целиком.
 
 6. dob — дата рождения СТРОГО в формате дд.мм.гггг (день.месяц.год, 4 цифры года).
    Пример: "18.11.1967". Никаких других форматов на выходе.
@@ -41,15 +32,15 @@ SYSTEM_PROMPT = """
    - Если даты нет — "".
 
 7. dl_number — номер водительских прав (UK driving licence), если он есть.
-   Приведи к верхнему регистру, лишние пробелы убери. Если нет — "".
+   Сохраняй символы как есть, включая пробел перед номером выпуска,
+   приведи к верхнему регистру, лишние пробелы убери. Если нет — "".
 
-8. address — адрес ОДНОЙ строкой. Сохрани ВСЕ части, что есть в тексте,
-   по порядку: "<дом и улица>, <район/пригород>, <город>, <ПОСТКОД>"
-   - Район/пригород НЕ ВЫКИДЫВАЙ. "St. Mellons (Trowbridge)" — оставь как есть.
+8. address — адрес ОДНОЙ строкой в формате Royal Mail:
+   "<номер дома и улица>, <город/населённый пункт>, <ПОСТКОД>"
    - Посткод ВСЕГДА ЗАГЛАВНЫМИ и В КОНЦЕ строки.
    - Названия улиц и города — в обычном регистре (Title Case).
    - Убери из конца страну: "United Kingdom", "UK", "England", "Great Britain".
-   - Если у адреса нет посткода — всё равно верни адрес.
+   - Убери дубли запятых и лишние пробелы.
    - Если адреса нет — "".
 
 ВАЖНО:
@@ -66,18 +57,11 @@ SYSTEM_PROMPT = """
 "address":"35 Serpentine Road, Kendal, LA9 4PE"}]}
 
 Ввод:
-"Mr Stewart Trevor\\nBarnes\\n01/08/1977\\n211 Ware Road, Hoddesdon, Hertfordshire, EN11 9AF"
+"Dr. Michael VAN DER BERG\nborn November 18, 1967\nno licence\n12A Fleet Street, London EC4Y 1AA"
 Вывод:
-{"people":[{"title":"Mr","gender":"M","first_name":"Stewart","middle_names":"Trevor",
-"last_name":"Barnes","dob":"01.08.1977","dl_number":"",
-"address":"211 Ware Road, Hoddesdon, Hertfordshire, EN11 9AF"}]}
-
-Ввод:
-"Miss Bethany Norman-Walker 08.04.1998 Pine Trees, Horsell Rise Close, Woking, GU21 4BB"
-Вывод:
-{"people":[{"title":"Miss","gender":"F","first_name":"Bethany","middle_names":"",
-"last_name":"Norman-Walker","dob":"08.04.1998","dl_number":"",
-"address":"Pine Trees, Horsell Rise Close, Woking, GU21 4BB"}]}
+{"people":[{"title":"Dr","gender":"M","first_name":"Michael","middle_names":"",
+"last_name":"Van Der Berg","dob":"18.11.1967","dl_number":"",
+"address":"12A Fleet Street, London, EC4Y 1AA"}]}
 """.strip()
 
 

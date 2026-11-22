@@ -8,9 +8,8 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 
 import config
-from address_check import verify_full_address, extract_postcode
 from llm_client import extract_people
-from normalizer import build_block, normalize_address
+from normalizer import build_block
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,7 +24,6 @@ HELP = (
     "Можно кидать как одну запись, так и несколько подряд — разделю и обработаю каждую.\n\n"
     "Команды:\n"
     "/id — узнать свой telegram user_id\n"
-    "/check <адрес> — проверить адрес вручную\n"
     "/help — эта справка"
 )
 
@@ -57,19 +55,6 @@ async def cmd_id(m: Message):
     await m.answer(f"Ваш user_id: <code>{m.from_user.id}</code>")
 
 
-@dp.message(Command("check"))
-async def cmd_check(m: Message):
-    addr = (m.text or "").replace("/check", "", 1).strip()
-    if not addr:
-        await m.answer("Пришли так: <code>/check 63 Matthysens Way, Cardiff, CF3 0PL</code>")
-        return
-
-    pc = extract_postcode(addr)
-    ok = await verify_full_address(addr)
-    verdict = {True: "✅ подтверждён", False: "❌ не найден", None: "⚠️ API лёг"}.get(ok, "?")
-    await m.answer(f"Посткод: <code>{pc or '—'}</code>\nРезультат: {verdict}")
-
-
 @dp.message(F.text)
 async def on_text(m: Message):
     if not _allowed(m):
@@ -96,18 +81,7 @@ async def on_text(m: Message):
         await m.answer("🤷 Ничего не нашёл. Попробуй прислать текст ещё раз.")
         return
 
-    blocks = []
-    for p in people:
-        addr = normalize_address(p.address or "")
-
-        if not addr:
-            final_addr = ""
-        else:
-            ok = await verify_full_address(addr)
-            final_addr = "(Ошибка)" if ok is False else addr
-
-        blocks.append(build_block(p, address_override=final_addr))
-
+    blocks = [build_block(p) for p in people]
     out = "\n\n———————————\n\n".join(blocks)
 
     for chunk in _chunks(out):
