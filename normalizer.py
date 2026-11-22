@@ -161,8 +161,9 @@ def _person_tokens(p: Person) -> list[str]:
 async def build_block(p: Person, raw_text: str = "") -> str:
     """Собирает итоговый блок. Фамилию определяет names.resolve_name (не LLM)."""
     dl_text = p.dl_number or ""
-    dl = parse_dl(dl_text) or parse_dl(raw_text)
-    dl_str = _dl_clean(dl_text) or (dl.number if dl else "")
+    # DL принимаем только если он реально похож на DL (16 симв.); NI-номера и прочее — мимо
+    dl = parse_dl(_dl_clean(dl_text)) or parse_dl(raw_text)
+    dl_str = dl.number if dl else ""
 
     tokens = _person_tokens(p)
     nm = resolve_name(

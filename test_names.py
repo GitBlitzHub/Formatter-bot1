@@ -21,3 +21,24 @@ def test_generate_male_short_surname():
 def test_not_enough_data():
     assert generate_dl("Smith", "John", "", "", "M") == ""
     assert generate_dl("Smith", "John", "", "01.02.1980", "U") == ""
+
+
+def test_ni_numbers_not_dl():
+    import asyncio
+    from normalizer import build_block
+    from schemas import Person
+    for ni in ("PB690472A", "SE757564A", "JZ102318C", "JM621924A"):
+        p = Person(name_tokens=["John", "Smith"], dob="01.02.1980", gender="M",
+                   surname_guess="Smith", dl_number=ni)
+        out = asyncio.run(build_block(p, f"John Smith {ni}"))
+        assert f"NUMBER DL: {ni}" not in out, out
+        assert "NUMBER DL: SMITH802010J" in out, out
+
+
+def test_real_dl_kept():
+    import asyncio
+    from normalizer import build_block
+    from schemas import Person
+    p = Person(name_tokens=["Judith", "Ann", "Deakin"], dob="18.11.1967", gender="F",
+               surname_guess="Deakin", dl_number="deaki661187ja9gy  39")
+    assert "NUMBER DL: DEAKI661187JA9GY 39" in asyncio.run(build_block(p, ""))
