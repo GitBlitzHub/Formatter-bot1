@@ -42,3 +42,24 @@ def test_real_dl_kept():
     p = Person(name_tokens=["Judith", "Ann", "Deakin"], dob="18.11.1967", gender="F",
                surname_guess="Deakin", dl_number="deaki661187ja9gy  39")
     assert "NUMBER DL: DEAKI661187JA9GY 39" in asyncio.run(build_block(p, ""))
+
+
+def test_gender_from_title_when_llm_unsure():
+    import asyncio
+    from normalizer import build_block
+    from schemas import Person
+    p = Person(title="Mr", gender="U", name_tokens=["Lee", "BARNARD"], surname_guess="BARNARD",
+               dob="10.05.1983")
+    assert "NUMBER DL: BARNA805103L99" in asyncio.run(build_block(p, ""))
+    p = Person(title="Mrs", gender="U", name_tokens=["Ann", "Hall"], surname_guess="Hall", dob="10.05.1983")
+    assert "NUMBER DL: HALL9855" in asyncio.run(build_block(p, ""))   # месяц 05+50=55
+
+
+def test_no_gender_gives_warning_not_silence():
+    import asyncio
+    from normalizer import build_block
+    from schemas import Person
+    p = Person(title="", gender="U", name_tokens=["Lee", "BARNARD"], surname_guess="BARNARD",
+               dob="10.05.1983")
+    out = asyncio.run(build_block(p, ""))
+    assert "NUMBER DL: \n" in out + "\n" and "не удалось определить пол" in out

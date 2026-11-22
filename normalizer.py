@@ -22,6 +22,8 @@ _TITLE_MAP = {
 }
 
 _GENDER_TITLE = {"M": "Mr", "F": "Ms"}
+_TITLE_GENDER = {"Mr": "M", "Sir": "M", "Lord": "M",
+                 "Mrs": "F", "Ms": "F", "Miss": "F", "Dame": "F", "Lady": "F"}
 
 
 def _clean_title(raw: str) -> str:
@@ -173,6 +175,8 @@ async def build_block(p: Person, raw_text: str = "") -> str:
 
     gender = nm.gender if nm.gender != "U" else p.gender
     title = _clean_title(p.title)
+    if gender not in ("M", "F"):          # LLM не определила пол — берём из титула
+        gender = _TITLE_GENDER.get(title, gender)
     if not title and gender in _GENDER_TITLE:
         title = _GENDER_TITLE[gender]
 
@@ -186,6 +190,10 @@ async def build_block(p: Person, raw_text: str = "") -> str:
         dl_str = generate_dl(nm.last, nm.first, nm.middle, dob, gender)
         if dl_str:
             warnings.append("DL не был указан — номер сгенерирован автоматически")
+        elif gender not in ("M", "F"):
+            warnings.append("DL не сгенерирован: не удалось определить пол (нужен титул Mr/Ms или DL)")
+        elif not dob:
+            warnings.append("DL не сгенерирован: нет даты рождения")
     if dl and dl.dob and dob and dl.dob != dob:
         warnings.append(f"DOB {dob} не совпадает с датой из номера прав ({dl.dob})")
     if dl and dl.dob and not dob:
