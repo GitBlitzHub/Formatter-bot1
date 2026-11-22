@@ -1,15 +1,23 @@
-import asyncio, sys, pathlib
+import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from address import verify_address
-C=[("35 Serpentine Road Kendal LA9 4PE",dict(number="35",street="Serpentine Road",town="Kendal",postcode="LA9 4PE")),
-("35 Serpentin Rd kendal la94pe",dict(number="35",street="Serpentin Rd",town="Kendal",postcode="la94pe")),
-("99 Serpentine Road Kendal LA9 4PE",dict(number="99",street="Serpentine Road",town="Kendal",postcode="LA9 4PE")),
-("35 Serpentine Road Kendal LA9 4PD (чужой посткод)",dict(number="35",street="Serpentine Road",town="Kendal",postcode="LA9 4PD")),
-("35 Serpentine Road Kendal (без посткода)",dict(number="35",street="Serpentine Road",town="Kendal")),
-("35 Serpentine Road Kendal ZZ1 1ZZ",dict(number="35",street="Serpentine Road",town="Kendal",postcode="ZZ1 1ZZ")),
-("12 Fantasy Lane Kendal LA9 4PE",dict(number="12",street="Fantasy Lane",town="Kendal",postcode="LA9 4PE")),
-]
-async def m():
-    for raw,kw in C:
-        r=await verify_address(raw,**kw); print(raw,"=>",r.status,"|",r.formatted,"|",r.notes,flush=True)
-asyncio.run(m())
+from dlgen import compute_check_letters, generate_dl, ebcdic_code
+
+
+def test_ebcdic():
+    assert (ebcdic_code("A"), ebcdic_code("J"), ebcdic_code("S"), ebcdic_code("0")) == (193, 209, 226, 240)
+
+
+def test_generate_female():
+    d = generate_dl("Deakin", "Judith", "Ann", "18.11.1967", "F")
+    assert d[:14] == "DEAKI661187JA9" and len(d) == 16
+    assert d[14:] == compute_check_letters(d[:14])
+
+
+def test_generate_male_short_surname():
+    d = generate_dl("Li", "John", "", "01.02.1980", "M")
+    assert d[:14] == "LI999802010J99"
+
+
+def test_not_enough_data():
+    assert generate_dl("Smith", "John", "", "", "M") == ""
+    assert generate_dl("Smith", "John", "", "01.02.1980", "U") == ""

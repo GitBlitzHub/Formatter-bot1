@@ -3,6 +3,7 @@ import re
 from datetime import datetime
 
 from address import verify_address
+from dlgen import generate_dl
 from names import parse_dl, resolve_name, tokenize_name
 from schemas import Person
 
@@ -179,6 +180,11 @@ async def build_block(p: Person, raw_text: str = "") -> str:
 
     dob = normalize_dob(p.dob)
     warnings = list(nm.warnings)
+
+    if not dl_str:
+        dl_str = generate_dl(nm.last, nm.first, nm.middle, dob, gender)
+        if dl_str:
+            warnings.append("DL не был указан — номер сгенерирован автоматически")
     if dl and dl.dob and dob and dl.dob != dob:
         warnings.append(f"DOB {dob} не совпадает с датой из номера прав ({dl.dob})")
     if dl and dl.dob and not dob:
