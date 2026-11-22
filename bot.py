@@ -81,7 +81,7 @@ async def on_text(m: Message):
         await m.answer("🤷 Ничего не нашёл. Попробуй прислать текст ещё раз.")
         return
 
-    blocks = [build_block(p) for p in people]
+    blocks = [await build_block(p, text) for p in people]
     out = "\n\n———————————\n\n".join(blocks)
 
     for chunk in _chunks(out):

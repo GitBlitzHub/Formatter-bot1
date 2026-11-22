@@ -3,40 +3,32 @@ from pydantic import BaseModel, Field
 
 
 class Person(BaseModel):
-    """Одна запись о человеке, как её вернула LLM (ещё не нормализованная)."""
+    """Одна запись, как её вернула LLM (ещё не проверенная кодом)."""
 
-    title: str = Field(
-        "",
-        description="Mr/Mrs/Ms/Miss/Dr/Prof/Sir/Dame/Lord/Lady/Mx или пусто",
+    title: str = ""
+    gender: Literal["M", "F", "U"] = "U"
+
+    # ФИО: LLM даёт только СЫРЬЁ. Итоговое разделение делает names.py.
+    name_tokens: List[str] = Field(
+        default_factory=list,
+        description="Все слова ФИО в порядке ввода, без титула",
     )
-    gender: Literal["M", "F", "U"] = Field(
-        "U",
-        description="Пол: M или F. 'U' если определить не удалось.",
-    )
-    first_name: str = Field(
-        "",
-        description="Только имя, без титула и фамилии",
-    )
-    middle_names: str = Field(
-        "",
-        description="Средние имена/инициалы через пробел, пусто если их нет",
-    )
-    last_name: str = Field(
-        "",
-        description="Только фамилия, включая составные (Van Der Berg, O'Brien-Smith)",
-    )
-    dob: str = Field(
-        "",
-        description="Дата рождения строго в формате дд.мм.гггг, пусто если нет даты",
-    )
-    dl_number: str = Field(
-        "",
-        description="Номер водительских прав, пусто если нет",
-    )
-    address: str = Field(
-        "",
-        description="Адрес одной строкой: улица, город, ПОСТКОД",
-    )
+    surname_guess: str = ""        # какая подстрока, по мнению LLM, фамилия
+    surname_marker: Literal["label", "comma", ""] = ""
+    first_name: str = ""           # запасной вариант, если name_tokens пуст
+    middle_names: str = ""
+    last_name: str = ""
+
+    dob: str = ""
+    dl_number: str = ""
+
+    # Адрес: сырая строка + разобранные части (для проверки)
+    address: str = ""
+    addr_flat: str = ""            # Flat 2 / Apartment 5 / название дома
+    addr_number: str = ""          # номер дома: 35, 12A
+    addr_street: str = ""
+    addr_town: str = ""
+    addr_postcode: str = ""
 
 
 class Extraction(BaseModel):

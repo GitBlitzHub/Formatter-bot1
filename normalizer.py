@@ -1,6 +1,9 @@
+import html
 import re
 from datetime import datetime
 
+from address import verify_address
+from names import parse_dl, resolve_name, tokenize_name
 from schemas import Person
 
 # ---------- титулы ----------
@@ -38,6 +41,18 @@ def _smart_title(text: str) -> str:
             out.append(w.title())
         else:
             out.append(w)
+    return " ".join(out)
+
+
+def _name_case(text: str) -> str:
+    """Регистр для имён: Mc/Mac не трогаем, O'Brien, Smith-Jones, van der."""
+    out = []
+    for w in (text or "").split():
+        if w.isupper() or w.islower():
+            w = re.sub(r"(^|['’\-])([a-z])", lambda m: m.group(1) + m.group(2).upper(), w.lower())
+            if w.lower().startswith("mc") and len(w) > 2:
+                w = "Mc" + w[2:3].upper() + w[3:]
+        out.append(w)
     return " ".join(out)
 
 
@@ -129,59 +144,83 @@ def normalize_dob(raw: str) -> str:
     return s
 
 
-# ---------- адрес ----------
-
-_UK_POSTCODE = re.compile(
-    r"\b(?:GIR\s?0AA|(?:[A-Z]{1,2}\d{1,2}[A-Z]?)\s?\d[A-Z]{2})\b",
-    re.IGNORECASE,
-)
-_COUNTRY_TAIL = re.compile(
-    r"[\s,]*\b(united kingdom|uk|great britain|england|scotland|wales|northern ireland)\b\.?[\s,]*$",
-    re.IGNORECASE,
-)
-
-
-def normalize_address(raw: str) -> str:
-    if not raw:
-        return ""
-
-    s = re.sub(r"\s+", " ", str(raw).strip())
-    s = _COUNTRY_TAIL.sub("", s)
-    s = re.sub(r"[\s,]+$", "", s)
-    s = re.sub(r"^[\s,]+", "", s)
-
-    postcode = ""
-    m = _UK_POSTCODE.search(s)
-    if m:
-        postcode = m.group(0).upper().replace("  ", " ")
-        s = (s[: m.start()] + " " + s[m.end():]).strip()
-
-    parts = [_smart_title(p) for p in re.split(r"[,\n]+", s) if p.strip(" ,")]
-    if postcode:
-        parts.append(postcode)
-
-    return ", ".join(parts)
-
-
 # ---------- сборка блока ----------
 
-def build_block(p: Person) -> str:
-    title = _clean_title(p.title)
-    if not title and p.gender in _GENDER_TITLE:
-        title = _GENDER_TITLE[p.gender]
+def _dl_clean(raw: str) -> str:
+    return re.sub(r"\s+", " ", (raw or "").strip()).upper()
 
-    name_parts = [title, _smart_title(p.first_name), _smart_title(p.middle_names)]
-    first_name = " ".join(x for x in name_parts if x).strip()
 
-    last_name = _smart_title(p.last_name).upper() if p.last_name else ""
-    dob = normalize_dob(p.dob)
-    dl = re.sub(r"\s+", " ", (p.dl_number or "").strip()).upper()
-    addr = normalize_address(p.address)
+def _person_tokens(p: Person) -> list[str]:
+    toks = [t for t in p.name_tokens if t and t.strip()]
+    if not toks:   # запасной путь: LLM не дала токены
+        toks = " ".join(x for x in (p.first_name, p.middle_names, p.last_name) if x).split()
+    return tokenize_name(" ".join(toks))
 
-    return (
-        f"FIRST NAME: {first_name}\n"
-        f"LAST NAME: {last_name}\n"
-        f"DOB: {dob}\n"
-        f"NUMBER DL: {dl}\n"
-        f"ADRESS: {addr}"
+
+async def build_block(p: Person, raw_text: str = "") -> str:
+    """Собирает итоговый блок. Фамилию определяет names.resolve_name (не LLM)."""
+    dl_text = p.dl_number or ""
+    dl = parse_dl(dl_text) or parse_dl(raw_text)
+    dl_str = _dl_clean(dl_text) or (dl.number if dl else "")
+
+    tokens = _person_tokens(p)
+    nm = resolve_name(
+        tokens, dl=dl, llm_last=p.surname_guess or p.last_name,
+        explicit=p.surname_marker, llm_first=p.first_name,
     )
+
+    gender = nm.gender if nm.gender != "U" else p.gender
+    title = _clean_title(p.title)
+    if not title and gender in _GENDER_TITLE:
+        title = _GENDER_TITLE[gender]
+
+    first_name = " ".join(x for x in (title, _name_case(nm.first), _name_case(nm.middle)) if x)
+    last_name = _name_case(nm.last).upper()
+
+    dob = normalize_dob(p.dob)
+    warnings = list(nm.warnings)
+    if dl and dl.dob and dob and dl.dob != dob:
+        warnings.append(f"DOB {dob} не совпадает с датой из номера прав ({dl.dob})")
+    if dl and dl.dob and not dob:
+        warnings.append(f"DOB не указана; по номеру прав это {dl.dob} (не подставлено автоматически)")
+
+    # адрес
+    ar = await verify_address(
+        p.address, flat=p.addr_flat, number=p.addr_number, street=p.addr_street,
+        town=p.addr_town, postcode=p.addr_postcode,
+    )
+    if ar.status == "NO_ADDRESS":
+        addr_line = ""
+    elif ar.status == "NOT_FOUND":
+        addr_line = "❌ АДРЕС НЕ НАЙДЕН"
+    else:
+        addr_line = ar.formatted
+
+    lines = [
+        f"FIRST NAME: {first_name}",
+        f"LAST NAME: {last_name}",
+        f"DOB: {dob}",
+        f"NUMBER DL: {dl_str}",
+        f"ADRESS: {addr_line}",
+    ]
+    lines = [html.escape(x) for x in lines]
+
+    badge = {
+        "VERIFIED": "✅ Адрес подтверждён по базе Royal Mail (PAF)",
+        "CONFIRMED": "✅ Адрес найден (посткод, улица и дом подтверждены по OSM)",
+        "STREET_OK": "🟡 Посткод и улица реальны, дом подтвердить не удалось",
+        "NOT_FOUND": "❌ Такого адреса нет / не удалось восстановить",
+    }.get(ar.status)
+    extra = []
+    if badge:
+        extra.append(badge)
+    extra += [f"• {n}" for n in ar.notes]
+    if ar.status == "NOT_FOUND" and p.address:
+        extra.append(f"• Введено: {p.address}")
+    extra += [f"⚠️ {w}" for w in warnings]
+    if nm.confidence == "high" and nm.reasons:
+        pass
+    if extra:
+        lines.append("")
+        lines.append("<i>" + "\n".join(html.escape(x) for x in extra) + "</i>")
+    return "\n".join(lines)
