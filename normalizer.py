@@ -215,7 +215,7 @@ async def build_block_details(
     # адрес
     ar = await verify_address(
         p.address, flat=p.addr_flat, number=p.addr_number, street=p.addr_street,
-        town=p.addr_town, postcode=p.addr_postcode,
+        town=p.addr_town, postcode=p.addr_postcode, locality=p.addr_locality,
     )
     if ar.status == "NO_ADDRESS":
         addr_line = ""

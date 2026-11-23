@@ -27,6 +27,7 @@ class Person(BaseModel):
     addr_flat: str = ""            # Flat 2 / Apartment 5 / название дома
     addr_number: str = ""          # номер дома: 35, 12A
     addr_street: str = ""
+    addr_locality: str = ""        # деревня / пригород / район (Dependent Locality)
     addr_town: str = ""
     addr_postcode: str = ""
 
