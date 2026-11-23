@@ -64,8 +64,9 @@ def test_main_reply_kb_properties():
     assert kb.input_field_placeholder
     assert len(kb.keyboard) == 1
     texts = [btn.text for btn in kb.keyboard[0]]
-    assert texts == [bot.BTN_MATCH, bot.BTN_RESET, bot.BTN_HELP]
-    assert set(texts) == bot.REPLY_BUTTON_TEXTS
+    assert texts == [bot.BTN_MATCH, bot.BTN_PHOTO, bot.BTN_HELP]
+    assert not hasattr(bot, "BTN_RESET")
+    assert set(texts).issubset(bot.REPLY_BUTTON_TEXTS)
 
     # Нигде в bot.py не используется ReplyKeyboardRemove
     bot_src = (Path(__file__).resolve().parent.parent / "bot.py").read_text(encoding="utf-8")
@@ -121,7 +122,7 @@ def test_reply_button_texts_do_not_call_llm_or_add_match_record(monkeypatch):
     handlers = bot.dp.message.handlers
     callback_names = [h.callback.__name__ for h in handlers]
     on_text_idx = callback_names.index("on_text")
-    for btn_handler in ("on_btn_match", "on_btn_reset", "on_btn_help"):
+    for btn_handler in ("on_btn_match", "on_btn_photo", "on_btn_help"):
         assert btn_handler in callback_names
         assert callback_names.index(btn_handler) < on_text_idx
 
@@ -145,7 +146,7 @@ def test_reply_btn_match_starts_and_shows_session(monkeypatch):
     assert isinstance(msg2.answer.call_args.kwargs.get("reply_markup"), InlineKeyboardMarkup)
 
 
-def test_reply_btn_reset_closes_active_session(monkeypatch):
+def test_cmd_match_reset_closes_active_session(monkeypatch):
     store = BatchStore(today_fn=lambda: "2026-11-23")
     monkeypatch.setattr(bot, "batch_store", store)
     monkeypatch.setattr(bot, "_allowed", lambda m: True)
@@ -154,8 +155,8 @@ def test_reply_btn_reset_closes_active_session(monkeypatch):
     monkeypatch.setattr(bot.media_group_buffer, "cancel_batch", lambda uid, bid: cancel_calls.append((uid, bid)))
 
     session, _, _ = store.get_or_create(104)
-    msg = _fake_message(104, text=bot.BTN_RESET)
-    asyncio.run(bot.on_btn_reset(msg))
+    msg = _fake_message(104, text="/match_reset")
+    asyncio.run(bot.cmd_match_reset(msg))
 
     assert store.get_active(104) is None
     assert cancel_calls == [(104, session.batch_id)]
@@ -168,7 +169,7 @@ def test_setup_bot_commands_registers_expected_commands():
     ok_bot.set_my_commands.assert_awaited_once()
     cmds = ok_bot.set_my_commands.call_args.args[0]
     assert all(isinstance(c, BotCommand) for c in cmds)
-    assert [c.command for c in cmds] == ["match", "match_reset", "help", "id"]
+    assert [c.command for c in cmds] == ["match", "match_reset", "photo", "help", "id"]
 
     # При ошибке API не падает
     failing_bot = SimpleNamespace(set_my_commands=AsyncMock(side_effect=RuntimeError("network down")))
@@ -191,7 +192,7 @@ def test_match_inline_keyboards_compact_and_callback_under_64_bytes():
     assert len(mkb.inline_keyboard) <= 3
     assert [b.text for b in mkb.inline_keyboard[0]] == ["🔗 Автоподбор"]
     assert [b.text for b in mkb.inline_keyboard[1]] == ["✋ Вручную", "👯 Дубль"]
-    assert [b.text for b in mkb.inline_keyboard[2]] == ["🖼 Фото (5)", "🗑 Сброс"]
+    assert [b.text for b in mkb.inline_keyboard[2]] == ["🖼 Фото (5)", "✂️ 35×45: Вкл", "🗑 Сброс"]
 
     # При include_auto=False (нехватка фото) порядок Вручную -> Дубль сохраняется без инверсии
     mkb_no_auto = bot._match_kb(session, include_auto=False)

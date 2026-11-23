@@ -29,6 +29,8 @@ class PhotoItem:
     vision_error: str = ""
     is_document: bool = False
     photo_bytes: bytes | None = None
+    raw_bytes: bytes | None = None
+    cropped_file_id: str | None = None
 
 
 @dataclass
@@ -49,6 +51,7 @@ class BatchSession:
     photos: list[PhotoItem] = field(default_factory=list)
     assignments: dict[int, MatchAssignment] = field(default_factory=dict)
     is_closed: bool = False
+    crop_35x45: bool = True
 
 
 def calc_age(dob_str: str, ref_date_str: str) -> int | None:
@@ -69,6 +72,13 @@ class BatchStore:
         self._today_fn: Callable[[], str] = today_fn or (lambda: date.today().isoformat())
         self._sessions: dict[int, BatchSession] = {}
         self._stale_cleared: set[int] = set()
+        self._crop_prefs: dict[int, bool] = {}
+
+    def set_crop_35x45(self, user_id: int, enabled: bool) -> None:
+        self._crop_prefs[user_id] = enabled
+        session = self.get_active(user_id)
+        if session is not None:
+            session.crop_35x45 = enabled
 
     def today(self) -> str:
         return self._today_fn()
@@ -104,6 +114,7 @@ class BatchStore:
             batch_id=secrets.token_hex(3),
             user_id=user_id,
             date_str=today,
+            crop_35x45=self._crop_prefs.get(user_id, True),
         )
         self._sessions[user_id] = session
         return session, True, cleared_stale
