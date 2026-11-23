@@ -1,6 +1,7 @@
 import html
 import re
 from datetime import datetime
+from typing import Literal
 
 from address import verify_address
 from dlgen import generate_dl
@@ -175,8 +176,10 @@ def _person_tokens(p: Person) -> list[str]:
     return toks
 
 
-async def build_block(p: Person, raw_text: str = "") -> str:
-    """Собирает итоговый блок. Фамилию определяет names.resolve_name (не LLM)."""
+async def build_block_details(
+    p: Person, raw_text: str = ""
+) -> tuple[str, Literal["M", "F", "U"], str, str]:
+    """Собирает итоговый блок и возвращает (full_block, gender, dob, display_name)."""
     tokens = _person_tokens(p)
     llm_last = (
         (p.last_name.strip() or p.surname_guess.strip())
@@ -197,6 +200,7 @@ async def build_block(p: Person, raw_text: str = "") -> str:
 
     first_name = " ".join(x for x in (title, _name_case(nm.first), _name_case(nm.middle)) if x)
     last_name = _name_case(nm.last).upper()
+    display_name = " ".join(x for x in (title, _name_case(nm.first), _name_case(nm.last)) if x)
 
     dob = normalize_dob(p.dob)
     warnings = list(nm.warnings)
@@ -247,7 +251,14 @@ async def build_block(p: Person, raw_text: str = "") -> str:
     if extra:
         lines.append("")
         lines.append("<i>" + "\n".join(html.escape(x) for x in extra) + "</i>")
-    return "\n".join(lines)
+    final_gender: Literal["M", "F", "U"] = gender if gender in ("M", "F") else "U"
+    return "\n".join(lines), final_gender, dob, display_name
+
+
+async def build_block(p: Person, raw_text: str = "") -> str:
+    """Собирает итоговый блок. Фамилию определяет names.resolve_name (не LLM)."""
+    full_block, _, _, _ = await build_block_details(p, raw_text)
+    return full_block
 
 
 _FIELD_KEYS = ("FIRST NAME:", "LAST NAME:", "DOB:", "NUMBER DL:", "ADRESS:")
