@@ -240,6 +240,9 @@ def resolve_name(
         if all(_norm(t) in _GIVEN for t in sur_tokens):
             score -= 12           # «фамилия» целиком из личных имён — подозрительно
 
+        if len(sur_tokens) == 1 and len(_norm(sur_tokens[0])) == 1 and any(len(_norm(t)) > 1 for t in tokens):
+            score -= 10           # однобуквенный инициал не должен побеждать как фамилия
+
         # частицы (Van, De...) должны входить в фамилию, а не в имя
         if rest and _norm(rest[-1]) in _PARTICLES and k < 3:
             score -= 8

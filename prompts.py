@@ -18,6 +18,9 @@ SYSTEM_PROMPT = """
 3. name_tokens — ВСЕ слова ФИО (без титула) СТРОГО в порядке, как они стоят во
    вводе. Ничего не переставляй, не добавляй, не выкидывай. Составную фамилию
    с частицами (Van Der Berg, De La Cruz) разбей на слова как есть.
+   Если во вводе поля разделены (например, строки FIRST NAME: и LAST NAME:),
+   включи в name_tokens слова из ОБЕИХ строк (имя/инициалы и фамилию), а
+   surname_marker поставь "label".
 
 4. surname_guess — твоя лучшая оценка, какие слова из name_tokens образуют
    ФАМИЛИЮ (точная подстрока из name_tokens). ФАМИЛИЯ МОЖЕТ СТОЯТЬ КАК В КОНЦЕ,
@@ -84,6 +87,15 @@ SYSTEM_PROMPT = """
 "last_name":"Van Der Berg","dob":"18.11.1967","dl_number":"",
 "address":"12A Fleet Street, London, EC4Y 1AA","addr_flat":"","addr_number":"12A",
 "addr_street":"Fleet Street","addr_town":"London","addr_postcode":"EC4Y 1AA"}]}
+
+Ввод (раздельные поля):
+"FIRST NAME: Mr Jason P T\nLAST NAME: HARMAN\nDOB: 02.11.1985\nNUMBER DL: \nADRESS: 22 Maritime Street, Pontypridd, CF37 1LQ"
+Вывод:
+{"people":[{"title":"Mr","gender":"M","name_tokens":["Jason","P","T","HARMAN"],
+"surname_guess":"HARMAN","surname_marker":"label","first_name":"Jason","middle_names":"P T",
+"last_name":"HARMAN","dob":"02.11.1985","dl_number":"",
+"address":"22 Maritime Street, Pontypridd, CF37 1LQ","addr_flat":"","addr_number":"22",
+"addr_street":"Maritime Street","addr_town":"Pontypridd","addr_postcode":"CF37 1LQ"}]}
 """.strip()
 
 
