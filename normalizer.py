@@ -4,7 +4,7 @@ from datetime import datetime
 
 from address import verify_address
 from dlgen import generate_dl
-from names import resolve_name, tokenize_name
+from names import _norm, resolve_name, tokenize_name
 from schemas import Person
 
 # ---------- титулы ----------
@@ -149,18 +149,42 @@ def normalize_dob(raw: str) -> str:
 
 # ---------- сборка блока ----------
 
+def _contains_tokens(tokens: list[str], target: list[str]) -> bool:
+    norm_toks = [_norm(t) for t in tokens if _norm(t)]
+    norm_target = [_norm(t) for t in target if _norm(t)]
+    if not norm_target or len(norm_target) > len(norm_toks):
+        return False
+    n = len(norm_target)
+    return any(norm_toks[i:i + n] == norm_target for i in range(len(norm_toks) - n + 1))
+
+
 def _person_tokens(p: Person) -> list[str]:
     toks = [t for t in p.name_tokens if t and t.strip()]
     if not toks:   # запасной путь: LLM не дала токены
         toks = " ".join(x for x in (p.first_name, p.middle_names, p.last_name) if x).split()
-    return tokenize_name(" ".join(toks))
+    toks = tokenize_name(" ".join(toks))
+    sur_src = (
+        (p.last_name.strip() or p.surname_guess.strip())
+        if p.surname_marker == "label"
+        else (p.surname_guess.strip() or p.last_name.strip())
+    )
+    if sur_src:
+        sur_toks = tokenize_name(sur_src)
+        if sur_toks and not _contains_tokens(toks, sur_toks):
+            toks.extend(sur_toks)
+    return toks
 
 
 async def build_block(p: Person, raw_text: str = "") -> str:
     """Собирает итоговый блок. Фамилию определяет names.resolve_name (не LLM)."""
     tokens = _person_tokens(p)
+    llm_last = (
+        (p.last_name.strip() or p.surname_guess.strip())
+        if p.surname_marker == "label"
+        else (p.surname_guess.strip() or p.last_name.strip())
+    )
     nm = resolve_name(
-        tokens, dl=None, llm_last=p.surname_guess or p.last_name,
+        tokens, dl=None, llm_last=llm_last,
         explicit=p.surname_marker, llm_first=p.first_name,
     )
 
