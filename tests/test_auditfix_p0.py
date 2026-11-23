@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import bot  # noqa: E402
 from normalizer import build_block  # noqa: E402
-from schemas import Person  # noqa: E402
+from schemas import Extraction, Person  # noqa: E402
 
 DL1 = "DEAKI661187JA9GY 39"
 MULTI_TEXT = (
@@ -81,3 +81,40 @@ def test_i01_single_person_dob_typo_dl_in_raw_text_preserved_with_warning(monkey
     out = _run_on_text("Judith Ann Deakin 19/11/1967 " + DL1, [p], monkeypatch)
     assert "NUMBER DL: " + DL1 in out
     assert "DOB" in out and "не совпадает" in out
+
+
+# ---------------- I-03 ----------------
+
+STR_FIELDS = ["title", "surname_guess", "first_name", "middle_names", "last_name",
+              "dob", "dl_number", "address", "addr_flat", "addr_number",
+              "addr_street", "addr_town", "addr_postcode"]
+
+
+def _ext(**fields):
+    return Extraction(**{"people": [fields]}).people[0]
+
+
+def test_i03_a_null_in_string_fields():
+    p = _ext(**{f: None for f in STR_FIELDS})
+    for f in STR_FIELDS:
+        assert getattr(p, f) == "", f
+
+
+def test_i03_b_gender_empty_and_invalid():
+    assert _ext(gender="").gender == "U"
+    assert _ext(gender=None).gender == "U"
+    assert _ext(gender="unknown").gender == "U"
+    assert _ext(gender="m").gender == "M"
+    assert _ext(gender="F").gender == "F"
+
+
+def test_i03_c_surname_marker_invalid():
+    assert _ext(surname_marker="caps").surname_marker == ""
+    assert _ext(surname_marker=None).surname_marker == ""
+    assert _ext(surname_marker="label").surname_marker == "label"
+    assert _ext(surname_marker="comma").surname_marker == "comma"
+
+
+def test_i03_d_null_in_list_field():
+    assert _ext(name_tokens=None).name_tokens == []
+    assert _ext(name_tokens=["John", None, "Smith"]).name_tokens == ["John", "Smith"]

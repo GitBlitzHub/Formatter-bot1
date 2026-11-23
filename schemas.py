@@ -1,5 +1,5 @@
 from typing import List, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 
 class Person(BaseModel):
@@ -29,6 +29,24 @@ class Person(BaseModel):
     addr_street: str = ""
     addr_town: str = ""
     addr_postcode: str = ""
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _coerce_llm_values(cls, v, info: ValidationInfo):
+        """I-03: LLM иногда шлёт null / неожиданные значения — не роняем весь пакет."""
+        if info.field_name == "name_tokens":
+            if v is None:
+                return []
+            if isinstance(v, list):
+                return [x for x in v if x is not None]
+            return v
+        if info.field_name == "gender":
+            g = v.strip().upper() if isinstance(v, str) else ""
+            return g if g in ("M", "F", "U") else "U"
+        if info.field_name == "surname_marker":
+            mk = v.strip().lower() if isinstance(v, str) else ""
+            return mk if mk in ("label", "comma", "") else ""
+        return "" if v is None else v
 
 
 class Extraction(BaseModel):
