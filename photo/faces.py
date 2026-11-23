@@ -7,10 +7,15 @@ from functools import lru_cache
 import numpy as np
 from PIL import Image
 
-MODELS_DIR = os.environ.get(
-    "MODELS_DIR",
-    os.path.join(os.path.dirname(__file__), "..", "models"),
-)
+def _resolve_models_dir() -> str:
+    return (
+        os.environ.get("MODELS_DIR")
+        or os.environ.get("FACE_MODELS_DIR")
+        or os.path.join(os.path.dirname(__file__), "..", "models")
+    )
+
+
+MODELS_DIR = _resolve_models_dir()
 PREDICTOR_68_FILENAME = "shape_predictor_68_face_landmarks.dat"
 
 
