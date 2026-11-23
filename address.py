@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from posttowns import norm_place, resolve_post_town
+
 log = logging.getLogger("address")
 
 IDEAL_KEY = os.getenv("IDEAL_POSTCODES_API_KEY", "").strip()
@@ -108,11 +110,63 @@ def _haversine(lat1, lon1, lat2, lon2) -> float:
     return 2 * r * math.asin(math.sqrt(a))
 
 
-def _join(flat: str, number: str, street: str, town: str, pc: str) -> str:
-    town = town.upper() if TOWN_UPPER else town
-    line1 = " ".join(x for x in (number, street) if x)
-    parts = [p for p in (flat, line1, town, pc) if p]
+def _clean_part(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip(" ,")).strip()
+
+
+def _join(flat: str, number: str, street: str, town: str, pc: str, locality: str = "") -> str:
+    flat = _clean_part(flat)
+    number = _clean_part(number)
+    street = _clean_part(street)
+    locality = _clean_part(locality)
+    town = _clean_part(town)
+    pc = _clean_part(pc)
+
+    if locality and town and norm_place(locality) == norm_place(town):
+        locality = ""
+    if locality and street:
+        ns, nl = norm_place(street), norm_place(locality)
+        if ns == nl or ns.endswith(" " + nl):
+            locality = ""
+
+    town_upper = TOWN_UPPER or os.getenv("ADDRESS_TOWN_UPPERCASE", "0").strip().lower() in {"1", "true", "yes"}
+    town_fmt = town.upper() if town_upper else town
+    line1 = " ".join(x for x in (number, street, locality) if x)
+    parts = [p for p in (flat, line1, town_fmt, pc) if p]
     return ", ".join(parts)
+
+
+def _resolve_locality_and_town(
+    pc: str,
+    town_in: str,
+    locality_in: str,
+    lr_town: str = "",
+    lr_locality: str = "",
+    pc_info: dict | None = None,
+    osm_town: str = "",
+) -> tuple[str, str]:
+    post_town = resolve_post_town(
+        pc, town_in=town_in, lr_town=lr_town, pc_info=pc_info, osm_town=osm_town,
+    )
+    loc = _clean_part(locality_in)
+    if not loc and town_in:
+        if norm_place(town_in) != norm_place(post_town):
+            admin_dist = (pc_info or {}).get("admin_district") or ""
+            parish = (pc_info or {}).get("parish") or ""
+            bua = (pc_info or {}).get("bua") or ""
+            if (
+                admin_dist
+                and norm_place(town_in) == norm_place(admin_dist)
+                and norm_place(town_in) not in {norm_place(parish), norm_place(bua)}
+            ):
+                loc = ""
+            else:
+                loc = _clean_part(town_in)
+    if not loc and lr_locality and norm_place(lr_locality) != norm_place(post_town):
+        loc = _title(_clean_part(lr_locality))
+    if loc and post_town and norm_place(loc) == norm_place(post_town):
+        loc = ""
+    return loc, post_town
 
 
 # -------------------------------------------------------------- HTTP ----
@@ -232,7 +286,10 @@ async def _paf_lookup(client, pc: str, flat: str, number: str, street: str):
 # и ни разу не продававшиеся объекты отсутствуют — отсутствие не доказывает «нет дома».
 
 _LR_URL = "https://landregistry.data.gov.uk/landregistry/query"
+_LR_TIMEOUT = httpx.Timeout(4.0)
 _LR_CACHE: dict[str, list[dict]] = {}
+_LR_DOWN_UNTIL = 0.0
+_LR_COOLDOWN_SEC = 60.0
 
 
 def _sq(v: str) -> str:
@@ -240,15 +297,28 @@ def _sq(v: str) -> str:
 
 
 async def _lr_query(client, where: str, key: str) -> list[dict]:
+    global _LR_DOWN_UNTIL
     if key in _LR_CACHE:
         return _LR_CACHE[key]
+    if time.monotonic() < _LR_DOWN_UNTIL:
+        return []
     q = ("PREFIX lrcommon: <http://landregistry.data.gov.uk/def/common/>\n"
-         "SELECT DISTINCT ?paon ?saon ?street ?town ?pc WHERE {\n" + where +
+         "SELECT DISTINCT ?paon ?saon ?street ?town ?locality ?pc WHERE {\n" + where +
          "\n OPTIONAL{?a lrcommon:paon ?paon} OPTIONAL{?a lrcommon:saon ?saon}"
          "\n ?a lrcommon:street ?street . OPTIONAL{?a lrcommon:town ?town}"
+         "\n OPTIONAL{?a lrcommon:locality ?locality}"
          "\n ?a lrcommon:postcode ?pc } LIMIT 400")
-    r = await _get(client, _LR_URL, params={"query": q},
-                   headers={"Accept": "application/sparql-results+json"})
+    try:
+        r = await client.get(
+            _LR_URL,
+            params={"query": q},
+            headers={"Accept": "application/sparql-results+json"},
+            timeout=_LR_TIMEOUT,
+        )
+    except (httpx.TimeoutException, httpx.TransportError) as e:
+        log.warning("HTTP %s: %s", _LR_URL, e)
+        _LR_DOWN_UNTIL = time.monotonic() + _LR_COOLDOWN_SEC
+        return []
     rows: list[dict] = []
     if r is not None and r.status_code == 200:
         try:
@@ -257,6 +327,8 @@ async def _lr_query(client, where: str, key: str) -> list[dict]:
         except (ValueError, KeyError):
             rows = []
         _LR_CACHE[key] = rows
+    elif r is None or r.status_code >= 500:
+        _LR_DOWN_UNTIL = time.monotonic() + _LR_COOLDOWN_SEC
     return rows
 
 
@@ -294,33 +366,37 @@ def _lr_match(rows: list[dict], flat: str, number: str, street: str):
     return best, hit, others
 
 
-async def _lr_verify(client, pc, flat, number, street, town_in, notes):
+async def _lr_verify(client, pc, flat, number, street, town_in, notes, locality_in="", pc_info=None):
     rows = await _lr_by_postcode(client, pc)
     if not rows or not street:
         return None
     best, hit, others = _lr_match(rows, flat, number, street)
     if best is None:
         return None
-    town = town_in or _title(next((r.get("town", "") for r in rows if r.get("street") == best), ""))
+    lr_town = _title(next((r.get("town", "") for r in rows if r.get("street") == best and r.get("town")), ""))
+    lr_locality = _title(next((r.get("locality", "") for r in rows if r.get("street") == best and r.get("locality")), ""))
+    loc, town = _resolve_locality_and_town(
+        pc, town_in, locality_in, lr_town=lr_town, lr_locality=lr_locality, pc_info=pc_info,
+    )
     name = _title(best)
     if _expand(street).lower() != name.lower():
         notes.append(f"Улица исправлена: «{street}» → «{name}»")
     if hit:
         notes.append("Дом найден в открытом реестре HM Land Registry")
-        return AddressResult("CONFIRMED", _join(flat, number, name, town, pc), notes)
+        return AddressResult("CONFIRMED", _join(flat, number, name, town, pc, locality=loc), notes)
     if not number:
-        return AddressResult("STREET_OK", _join(flat, "", name, town, pc), notes)
+        return AddressResult("STREET_OK", _join(flat, "", name, town, pc, locality=loc), notes)
     # дом с таким номером на этой улице под ЭТИМ посткодом не найден: ищем под другим
     alt = await _lr_by_street(client, best, town_in, number)
     alt = [r for r in alt if r.get("pc") and r["pc"] != pc]
     if alt:
         npc = alt[0]["pc"]
         notes.append(f"Дом {number} на {name} числится под посткодом {npc}, а не {pc} — посткод исправлен")
-        return AddressResult("CONFIRMED", _join(flat, number, name, town, npc), notes)
+        return AddressResult("CONFIRMED", _join(flat, number, name, town, npc, locality=loc), notes)
     notes.append(f"Посткод и улица реальны, но дома {number} в реестре нет "
                  f"(на этой улице под {pc} есть: {', '.join(others)}). Возможна ошибка в номере "
                  "либо дом не продавался с 1995 г.")
-    return AddressResult("STREET_OK", _join(flat, number, name, town, pc), notes)
+    return AddressResult("STREET_OK", _join(flat, number, name, town, pc, locality=loc), notes)
 
 
 # ------------------------------------------ 2b. бесплатно: OSM + postcodes.io ----
@@ -426,29 +502,28 @@ async def _osm_check(client, lat: float, lon: float, number: str, street: str, p
     return None, False, "", ""
 
 
-async def _free_lookup(client, pc: str, pc_info: dict | None, flat, number, street, town_in, notes):
+async def _free_lookup(client, pc: str, pc_info: dict | None, flat, number, street, town_in, notes, locality_in=""):
     """Свободная проверка. Возвращает AddressResult."""
     lat = lon = None
     if pc_info:
         lat, lon = pc_info.get("latitude"), pc_info.get("longitude")
 
-    # город: сначала от Nominatim по центру посткода
-    town = ""
-    if lat is not None:
+    # город: сначала проверяем локальный справочник outcode -> Post Town
+    nom_town = ""
+    if not resolve_post_town(pc, town_in=town_in, pc_info=pc_info) and lat is not None:
         res = await _nominatim(client, {"q": pc})
         for r in res:
             a = r.get("address", {})
             if a.get("postcode", "").replace(" ", "").upper().startswith(pc.replace(" ", "")[:-1].upper()):
-                town = a.get("town") or a.get("city") or a.get("village") or a.get("hamlet") or ""
-                if town:
+                nom_town = a.get("town") or a.get("city") or a.get("village") or a.get("hamlet") or ""
+                if nom_town:
                     break
-    if not town:
-        town = _title((pc_info or {}).get("admin_district") or "")
 
     if not street:
         # улицы нет — подтвердить нечего, кроме посткода
         notes.append("Улица не указана — проверен только посткод")
-        out = _join(flat, number, "", town, pc)
+        loc, town = _resolve_locality_and_town(pc, town_in, locality_in, pc_info=pc_info, osm_town=nom_town)
+        out = _join(flat, number, "", town, pc, locality=loc)
         return AddressResult("STREET_OK", out, notes)
 
     if lat is None:
@@ -463,19 +538,18 @@ async def _free_lookup(client, pc: str, pc_info: dict | None, flat, number, stre
 
     if _ssim(street, found) < 0.97 or _expand(street).lower() != found.lower():
         notes.append(f"Улица исправлена: «{street}» → «{found}»")
-    if town_in:
-        town = town_in           # post town из PAF бесплатно не узнать — доверяем вводу
-    elif house_town:
-        town = _title(house_town)
+    loc, town = _resolve_locality_and_town(
+        pc, town_in, locality_in, pc_info=pc_info, osm_town=house_town or nom_town,
+    )
     if house:
         if house_pc and format_postcode(house_pc) != pc:
             notes.append(f"В OSM этот дом числится под посткодом {format_postcode(house_pc)}")
-        out = _join(flat, number, found, town, pc)
+        out = _join(flat, number, found, town, pc, locality=loc)
         return AddressResult("CONFIRMED", out, notes)
 
     if number:
         notes.append("Номер дома не удалось подтвердить (в бесплатных данных OSM есть не все дома)")
-    out = _join(flat, number, found, town, pc)
+    out = _join(flat, number, found, town, pc, locality=loc)
     return AddressResult("STREET_OK", out, notes)
 
 
@@ -527,7 +601,7 @@ async def _restore_postcode(client, pc, number, street, town):
 
 async def verify_address(
     raw: str, *, flat: str = "", number: str = "", street: str = "",
-    town: str = "", postcode: str = "",
+    town: str = "", postcode: str = "", locality: str = "",
 ) -> AddressResult:
     raw = re.sub(r"\s+", " ", (raw or "").strip())
     if not raw and not (street or postcode):
@@ -556,6 +630,7 @@ async def verify_address(
 
     number, street = number.strip(), _title(_expand(street.strip())) if street else ""
     flat, town = _title(flat.strip()), _title(town.strip())
+    locality = _title(locality.strip())
     notes: list[str] = []
 
     async with httpx.AsyncClient(timeout=_TIMEOUT, headers={"User-Agent": UA}) as client:
@@ -591,7 +666,7 @@ async def verify_address(
                 return AddressResult("NOT_FOUND", "", notes + n)
             notes.append("PAF-сервис недоступен — использована бесплатная проверка")
 
-        res = await _lr_verify(client, pc, flat, number, street, town, list(notes))
+        res = await _lr_verify(client, pc, flat, number, street, town, list(notes), locality_in=locality, pc_info=info)
         if res is not None:
             return res
-        return await _free_lookup(client, pc, info, flat, number, street, town, notes)
+        return await _free_lookup(client, pc, info, flat, number, street, town, notes, locality_in=locality)
