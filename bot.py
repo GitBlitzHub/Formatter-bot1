@@ -12,12 +12,15 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
+    BotCommand,
     BufferedInputFile,
     CallbackQuery,
     Document,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 
 import config
@@ -69,15 +72,56 @@ def _chunks(text: str, size: int = 3900):
         text = text[size:]
 
 
+BTN_MATCH = "📦 Match"
+BTN_RESET = "🗑 Сброс"
+BTN_HELP = "❓ Помощь"
+REPLY_BUTTON_TEXTS = {BTN_MATCH, BTN_RESET, BTN_HELP}
+
+
+def main_reply_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text=BTN_MATCH),
+                KeyboardButton(text=BTN_RESET),
+                KeyboardButton(text=BTN_HELP),
+            ]
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Пришлите данные или фото...",
+    )
+
+
 CLEAN_CALLBACK_DATA = "clean_blocks"
 
 
 def _clean_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🧹 Только строки (без лишнего)", callback_data=CLEAN_CALLBACK_DATA)]
+            [InlineKeyboardButton(text="🧹 Только строки", callback_data=CLEAN_CALLBACK_DATA)]
         ]
     )
+
+
+def _open_match_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Включить Match", callback_data="pm:open")]
+        ]
+    )
+
+
+async def _edit_or_send(
+    message: Message,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    try:
+        await message.edit_text(text, reply_markup=reply_markup)
+    except Exception:
+        await message.answer(text, reply_markup=reply_markup)
 
 
 def _batch_status_text(session: BatchSession) -> str:
@@ -101,24 +145,27 @@ def _batch_status_text(session: BatchSession) -> str:
     return "\n".join(lines)
 
 
-def _match_kb(session: BatchSession) -> InlineKeyboardMarkup:
+def _match_kb(session: BatchSession, include_auto: bool = True) -> InlineKeyboardMarkup:
     bid = session.batch_id
     rows: list[list[InlineKeyboardButton]] = []
     if session.records and session.photos:
+        if include_auto:
+            rows.append([
+                InlineKeyboardButton(text="🔗 Автоподбор", callback_data=f"pm:{bid}:auto"),
+            ])
         rows.append([
-            InlineKeyboardButton(text="🔗 Связать автоматически", callback_data=f"pm:{bid}:auto"),
+            InlineKeyboardButton(text="✋ Вручную", callback_data=f"pm:{bid}:man"),
+            InlineKeyboardButton(text="👯 Дубль", callback_data=f"pm:{bid}:dup"),
         ])
-        rows.append([
-            InlineKeyboardButton(text="✋ Выбрать вручную", callback_data=f"pm:{bid}:man"),
-            InlineKeyboardButton(text="👯 Выбрать дубль", callback_data=f"pm:{bid}:dup"),
-        ])
+    bottom_row: list[InlineKeyboardButton] = []
     if session.photos:
-        rows.append([
-            InlineKeyboardButton(text="🖼 Показать фото с номерами", callback_data=f"pm:{bid}:showp"),
-        ])
-    rows.append([
-        InlineKeyboardButton(text="🗑 Закрыть / Сбросить пачку", callback_data=f"pm:{bid}:reset"),
-    ])
+        bottom_row.append(
+            InlineKeyboardButton(text=f"🖼 Фото ({len(session.photos)})", callback_data=f"pm:{bid}:showp")
+        )
+    bottom_row.append(
+        InlineKeyboardButton(text="🗑 Сброс", callback_data=f"pm:{bid}:reset")
+    )
+    rows.append(bottom_row)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -139,20 +186,32 @@ def _select_record_kb(session: BatchSession, mode: str) -> InlineKeyboardMarkup:
         rows.append([
             InlineKeyboardButton(text=label, callback_data=f"pm:{bid}:sr:{r.index}:{mode}")
         ])
-    rows.append([InlineKeyboardButton(text="🗑 Закрыть пачку", callback_data=f"pm:{bid}:reset")])
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Назад", callback_data=f"pm:{bid}:back"),
+        InlineKeyboardButton(text="🗑 Сброс", callback_data=f"pm:{bid}:reset"),
+    ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _select_photo_kb(session: BatchSession, rec_idx: int, mode: str) -> InlineKeyboardMarkup:
     bid = session.batch_id
     rows: list[list[InlineKeyboardButton]] = []
+    pair: list[InlineKeyboardButton] = []
     for p in session.photos:
-        age_txt = f"~{p.age} г." if p.age is not None else "? г."
-        label = f"Фото #{p.index + 1} ({p.gender}, {age_txt})"
-        rows.append([
+        age_txt = f"~{p.age}" if p.age is not None else "?"
+        label = f"🖼 #{p.index + 1} ({p.gender}, {age_txt})"
+        pair.append(
             InlineKeyboardButton(text=label, callback_data=f"pm:{bid}:sp:{rec_idx}:{p.index}:{mode}")
-        ])
-    rows.append([InlineKeyboardButton(text="🖼 Показать фото с номерами", callback_data=f"pm:{bid}:showp")])
+        )
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Назад", callback_data=f"pm:{bid}:back:{mode}"),
+        InlineKeyboardButton(text="🖼 Показать фото", callback_data=f"pm:{bid}:showp"),
+    ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -222,25 +281,21 @@ async def send_match_card(
 
 @dp.message(CommandStart())
 async def cmd_start(m: Message):
-    await m.answer(HELP)
+    await m.answer(HELP, reply_markup=main_reply_kb())
 
 
 @dp.message(Command("help"))
 async def cmd_help(m: Message):
-    await m.answer(HELP)
+    await m.answer(HELP, reply_markup=main_reply_kb())
 
 
 @dp.message(Command("id"))
 async def cmd_id(m: Message):
-    await m.answer(f"Ваш user_id: <code>{m.from_user.id}</code>")
+    await m.answer(f"Ваш user_id: <code>{m.from_user.id}</code>", reply_markup=main_reply_kb())
 
 
-@dp.message(Command("match"))
-async def cmd_match(m: Message):
-    if not _allowed(m):
-        await m.answer(f"Нет доступа. Ваш user_id: {m.from_user.id}")
-        return
-    session, created, cleared_stale = batch_store.get_or_create(m.from_user.id)
+def _match_open_text_and_kb(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    session, created, cleared_stale = batch_store.get_or_create(user_id)
     prefix = "🧹 Устаревшая пачка за прошлый день была автоматически очищена.\n\n" if cleared_stale else ""
     if created:
         msg = (
@@ -248,9 +303,18 @@ async def cmd_match(m: Message):
             f"дата <code>{session.date_str}</code>).\n"
             "Присылайте строки (текстом) и фотографии (по одной или альбомом)."
         )
-        await m.answer(msg, reply_markup=_match_kb(session))
     else:
-        await m.answer(prefix + _batch_status_text(session), reply_markup=_match_kb(session))
+        msg = prefix + _batch_status_text(session)
+    return msg, _match_kb(session)
+
+
+@dp.message(Command("match"))
+async def cmd_match(m: Message):
+    if not _allowed(m):
+        await m.answer(f"Нет доступа. Ваш user_id: {m.from_user.id}")
+        return
+    msg, kb = _match_open_text_and_kb(m.from_user.id)
+    await m.answer(msg, reply_markup=kb)
 
 
 @dp.message(Command("match_reset", "cancel"))
@@ -261,9 +325,36 @@ async def cmd_match_reset(m: Message):
     removed = batch_store.reset(m.from_user.id)
     if removed is not None:
         media_group_buffer.cancel_batch(m.from_user.id, removed.batch_id)
-        await m.answer(f"🗑 Пачка <code>{removed.batch_id}</code> закрыта и очищена.")
+        await m.answer(
+            f"🗑 Пачка <code>{removed.batch_id}</code> закрыта и очищена.",
+            reply_markup=main_reply_kb(),
+        )
     else:
-        await m.answer("Активной пачки /match нет.")
+        await m.answer("Активной пачки /match нет.", reply_markup=main_reply_kb())
+
+
+@dp.message(F.text == BTN_MATCH)
+async def on_btn_match(m: Message):
+    if not _allowed(m):
+        await m.answer(f"Нет доступа. Ваш user_id: {m.from_user.id}")
+        return
+    await cmd_match(m)
+
+
+@dp.message(F.text == BTN_RESET)
+async def on_btn_reset(m: Message):
+    if not _allowed(m):
+        await m.answer(f"Нет доступа. Ваш user_id: {m.from_user.id}")
+        return
+    await cmd_match_reset(m)
+
+
+@dp.message(F.text == BTN_HELP)
+async def on_btn_help(m: Message):
+    if not _allowed(m):
+        await m.answer(f"Нет доступа. Ваш user_id: {m.from_user.id}")
+        return
+    await cmd_help(m)
 
 
 @dp.message(F.text)
@@ -272,8 +363,8 @@ async def on_text(m: Message):
         await m.answer(f"Нет доступа. Ваш user_id: {m.from_user.id}")
         return
 
-    text = m.text.strip()
-    if not text or text.startswith("/"):
+    text = (m.text or "").strip()
+    if not text or text.startswith("/") or text in REPLY_BUTTON_TEXTS:
         return
 
     await m.bot.send_chat_action(m.chat.id, "typing")
@@ -284,12 +375,16 @@ async def on_text(m: Message):
         log.exception("LLM call failed")
         await m.answer(
             "⏳ LLM сейчас недоступна или перегружена. Попробуй ещё раз через минуту.\n\n"
-            f"<code>{type(e).__name__}: {str(e)[:200]}</code>"
+            f"<code>{type(e).__name__}: {str(e)[:200]}</code>",
+            reply_markup=main_reply_kb(),
         )
         return
 
     if not people:
-        await m.answer("🤷 Ничего не нашёл. Попробуй прислать текст ещё раз.")
+        await m.answer(
+            "🤷 Ничего не нашёл. Попробуй прислать текст ещё раз.",
+            reply_markup=main_reply_kb(),
+        )
         return
 
     session = batch_store.get_active(m.from_user.id)
@@ -332,7 +427,7 @@ async def on_text(m: Message):
             blocks.append(f"⚠️ Ошибка обработки записи: <code>{type(e).__name__}: {str(e)[:200]}</code>")
     out = "\n\n———————————\n\n".join(blocks)
 
-    kb = _clean_kb() if "FIRST NAME:" in out else None
+    kb = _clean_kb() if "FIRST NAME:" in out else main_reply_kb()
     for chunk in _chunks(out):
         await m.answer(chunk, reply_markup=kb)
 
@@ -440,7 +535,10 @@ async def on_photo(m: Message):
 
     session = batch_store.get_active(m.from_user.id)
     if session is None:
-        await m.answer("Чтобы подбирать фото к строкам, включите режим /match")
+        await m.answer(
+            "Чтобы подбирать фото к строкам, включите режим /match",
+            reply_markup=_open_match_kb(),
+        )
         return
 
     if m.media_group_id:
@@ -480,7 +578,10 @@ async def on_document(m: Message):
 
     session = batch_store.get_active(m.from_user.id)
     if session is None:
-        await m.answer("Чтобы подбирать фото к строкам, включите режим /match")
+        await m.answer(
+            "Чтобы подбирать фото к строкам, включите режим /match",
+            reply_markup=_open_match_kb(),
+        )
         return
 
     if not _is_image_document(m.document):
@@ -525,13 +626,19 @@ async def on_pm_callback(callback: CallbackQuery):
         await callback.answer("Нет доступа.", show_alert=True)
         return
 
+    user_id = callback.from_user.id
+    if callback.data == "pm:open":
+        msg, kb = _match_open_text_and_kb(user_id)
+        await callback.message.answer(msg, reply_markup=kb)
+        await callback.answer()
+        return
+
     parts = (callback.data or "").split(":")
     if len(parts) < 3:
         await callback.answer()
         return
 
     _, batch_id, action, *rest = parts
-    user_id = callback.from_user.id
     if not batch_store.is_valid_batch(user_id, batch_id):
         await callback.answer("Пачка устарела или закрыта. Включите /match заново.", show_alert=True)
         return
@@ -550,7 +657,10 @@ async def on_pm_callback(callback: CallbackQuery):
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await callback.message.answer(f"🗑 Пачка <code>{batch_id}</code> закрыта и очищена.")
+        await callback.message.answer(
+            f"🗑 Пачка <code>{batch_id}</code> закрыта и очищена.",
+            reply_markup=main_reply_kb(),
+        )
         await callback.answer("Пачка закрыта")
         return
 
@@ -591,14 +701,10 @@ async def on_pm_callback(callback: CallbackQuery):
             for r in unmatched:
                 age_txt = f"{r.age} л." if r.age is not None else "? л."
                 lines.append(f"• #{r.index + 1} {html.escape(r.display_name)} ({r.gender}, {age_txt})")
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="👯 Выбрать дубль", callback_data=f"pm:{batch_id}:dup"),
-                    InlineKeyboardButton(text="✋ Выбрать вручную", callback_data=f"pm:{batch_id}:man"),
-                ],
-                [InlineKeyboardButton(text="🗑 Закрыть / Сбросить пачку", callback_data=f"pm:{batch_id}:reset")],
-            ])
-            await callback.message.answer("\n".join(lines), reply_markup=kb)
+            await callback.message.answer(
+                "\n".join(lines),
+                reply_markup=_match_kb(session, include_auto=False),
+            )
         else:
             await callback.message.answer("✅ Все строки сматчены и выданы!", reply_markup=_match_kb(session))
         await callback.answer()
@@ -610,7 +716,32 @@ async def on_pm_callback(callback: CallbackQuery):
             return
         mode = "d" if action == "dup" else "m"
         title = "Выберите строку для дубля фото:" if mode == "d" else "Выберите строку для ручного назначения фото:"
-        await callback.message.answer(title, reply_markup=_select_record_kb(session, mode))
+        await _edit_or_send(callback.message, title, reply_markup=_select_record_kb(session, mode))
+        await callback.answer()
+        return
+
+    if action == "back":
+        if rest:
+            mode = rest[0]
+            if not session.records or not session.photos:
+                await _edit_or_send(
+                    callback.message,
+                    _batch_status_text(session),
+                    reply_markup=_match_kb(session),
+                )
+            else:
+                title = "Выберите строку для дубля фото:" if mode == "d" else "Выберите строку для ручного назначения фото:"
+                await _edit_or_send(
+                    callback.message,
+                    title,
+                    reply_markup=_select_record_kb(session, mode),
+                )
+        else:
+            await _edit_or_send(
+                callback.message,
+                _batch_status_text(session),
+                reply_markup=_match_kb(session),
+            )
         await callback.answer()
         return
 
@@ -621,7 +752,8 @@ async def on_pm_callback(callback: CallbackQuery):
             await callback.answer("Строка не найдена.", show_alert=True)
             return
         rec = session.records[rec_idx]
-        await callback.message.answer(
+        await _edit_or_send(
+            callback.message,
             f"Выберите фото для <b>#{rec.index + 1} {html.escape(rec.display_name)}</b>:",
             reply_markup=_select_photo_kb(session, rec_idx, mode),
         )
@@ -654,12 +786,26 @@ async def on_pm_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+async def _setup_bot_commands(bot: Bot) -> None:
+    commands = [
+        BotCommand(command="match", description="Режим сопоставления фото и строк"),
+        BotCommand(command="match_reset", description="Закрыть текущую пачку"),
+        BotCommand(command="help", description="Справка по работе бота"),
+        BotCommand(command="id", description="Узнать свой Telegram user_id"),
+    ]
+    try:
+        await bot.set_my_commands(commands)
+    except Exception as e:
+        log.warning("Не удалось зарегистрировать BotCommand: %s", e)
+
+
 async def main():
     bot = Bot(
         config.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     me = await bot.get_me()
+    await _setup_bot_commands(bot)
     log.info("Бот запущен как @%s (id=%s), провайдер: %s, модели: %s",
              me.username, me.id, config.LLM_BASE_URL, config.LLM_MODELS)
     await dp.start_polling(bot)
