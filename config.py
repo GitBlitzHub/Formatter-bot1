@@ -46,7 +46,7 @@ LLM_MODEL = LLM_MODELS[0]
 
 
 # ---------- Vision ----------
-DEFAULT_VISION_MODEL = "meta-llama/llama-4-maverick-17b-128e-instruct"
+DEFAULT_VISION_MODEL = "qwen/qwen3.8-27b"
 VISION_MODEL = _env("VISION_MODEL", default=DEFAULT_VISION_MODEL)
 VISION_API_KEY = _env("VISION_API_KEY") or LLM_API_KEY
 VISION_BASE_URL = (_env("VISION_BASE_URL") or LLM_BASE_URL).rstrip("/")

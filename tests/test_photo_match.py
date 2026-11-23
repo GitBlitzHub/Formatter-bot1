@@ -43,6 +43,10 @@ def test_config_vision_model_fallback_to_llm_env(monkeypatch):
     importlib.reload(config)
 
 
+def test_config_vision_model_default_is_qwen():
+    assert config.DEFAULT_VISION_MODEL == "qwen/qwen3.8-27b"
+
+
 def test_build_block_details_compatible_with_build_block():
     p = Person(
         title="Mr",
@@ -123,6 +127,64 @@ def test_vision_handles_invalid_json_and_api_error_gracefully(monkeypatch):
     assert "API down" in res2.error
 
 
+def test_analyze_photo_compresses_oversized_input(monkeypatch):
+    import base64
+    import io
+    import os
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from PIL import Image
+    import vision_client
+
+    # Создаём большой > 1.5 MB JPEG
+    noise = os.urandom(1600 * 1200 * 3)
+    img = Image.frombytes("RGB", (1600, 1200), noise)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=98)
+    big_bytes = buf.getvalue()
+    assert len(big_bytes) > 1_500_000
+
+    captured = {}
+
+    async def _fake_create(**kwargs):
+        captured["url"] = kwargs["messages"][1]["content"][1]["image_url"]["url"]
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"gender": "M", "age": 30}'))]
+        )
+
+    fake_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(side_effect=_fake_create)))
+    )
+    monkeypatch.setattr(vision_client, "_client", fake_client)
+
+    res = asyncio.run(vision_client.analyze_photo(big_bytes, mime_type="image/png"))
+    assert res.gender == "M"
+    assert res.age == 30
+    assert captured["url"].startswith("data:image/jpeg;base64,")
+    b64_part = captured["url"].split(",", 1)[1]
+    assert len(b64_part) <= 4_000_000
+    assert len(base64.b64decode(b64_part)) <= 1_500_000
+
+
+def test_analyze_photo_invalid_large_bytes_returns_error(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import vision_client
+
+    create_mock = AsyncMock()
+    monkeypatch.setattr(
+        vision_client,
+        "_client",
+        SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create_mock))),
+    )
+
+    res = asyncio.run(vision_client.analyze_photo(b"not-an-image-" * 200_000, mime_type="image/jpeg"))
+    assert res.gender == "U"
+    assert res.age is None
+    assert res.error == "invalid image"
+    assert not create_mock.called
+
+
 def _make_record(idx: int, gender: str, dob: str = "", age: int | None = None):
     from batch_store import MatchRecord
     from schemas import Person
@@ -192,6 +254,31 @@ def test_manual_reset_closes_batch_and_rejects_old_callbacks():
     assert removed.is_closed is True
     assert store.get_active(202) is None
     assert store.is_valid_batch(202, old_id) is False
+
+
+def test_photo_item_defaults_and_media_group_buffer_first_flag():
+    from batch_store import MediaGroupBuffer, PhotoItem
+
+    item = PhotoItem(index=0, file_id="f1", file_unique_id="u1", gender="M", age=30)
+    assert item.is_document is False
+    assert item.photo_bytes is None
+
+    async def _run():
+        buf = MediaGroupBuffer(delay=0.05)
+
+        async def _noop(*args):
+            pass
+
+        is_first_1 = buf.add(1, "grp1", "b1", "m1", _noop)
+        is_first_2 = buf.add(1, "grp1", "b1", "m2", _noop)
+        is_first_3 = buf.add(1, "grp2", "b1", "m3", _noop)
+        buf.cancel_batch(1, "b1")
+        return is_first_1, is_first_2, is_first_3
+
+    r1, r2, r3 = asyncio.run(_run())
+    assert r1 is True
+    assert r2 is False
+    assert r3 is True
 
 
 def test_matcher_strict_gender_separation():
@@ -518,6 +605,288 @@ def test_all_callback_data_under_64_bytes():
         for row in kb.inline_keyboard:
             for btn in row:
                 assert len(btn.callback_data.encode("utf-8")) <= 64
+
+
+def _make_tiny_png_bytes() -> bytes:
+    import io
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 64), (100, 150, 200)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _make_fake_document_message(
+    user_id: int = 1,
+    doc_id: str = "doc_1",
+    file_name: str | None = "IMG_4840.JPG",
+    mime_type: str | None = "image/jpeg",
+    media_group_id: str | None = None,
+    raw_bytes: bytes | None = None,
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    payload = raw_bytes if raw_bytes is not None else _make_tiny_png_bytes()
+
+    async def _download(file_obj, destination):
+        destination.write(payload)
+
+    return SimpleNamespace(
+        text=None,
+        photo=None,
+        document=SimpleNamespace(
+            file_id=doc_id,
+            file_unique_id=f"u_{doc_id}",
+            file_name=file_name,
+            mime_type=mime_type,
+        ),
+        media_group_id=media_group_id,
+        from_user=SimpleNamespace(id=user_id),
+        chat=SimpleNamespace(id=user_id),
+        bot=SimpleNamespace(
+            send_chat_action=AsyncMock(),
+            download=AsyncMock(side_effect=_download),
+            send_photo=AsyncMock(),
+            send_message=AsyncMock(),
+        ),
+        answer=AsyncMock(),
+    )
+
+
+def test_on_document_without_active_batch_prompts_match(monkeypatch):
+    from unittest.mock import AsyncMock
+    import bot
+    from batch_store import BatchStore
+
+    store = BatchStore(today_fn=lambda: "2026-11-23")
+    monkeypatch.setattr(bot, "batch_store", store)
+    monkeypatch.setattr(bot, "_allowed", lambda m: True)
+    vision_mock = AsyncMock()
+    monkeypatch.setattr(bot, "analyze_photo", vision_mock)
+
+    m = _make_fake_document_message(user_id=601, file_name="photo.jpg", mime_type="image/jpeg")
+    asyncio.run(bot.on_document(m))
+
+    assert m.answer.called
+    assert "Чтобы подбирать фото к строкам, включите режим /match" in m.answer.call_args_list[0].args[0]
+    assert not vision_mock.called
+
+
+def test_on_document_accepts_image_mime_and_extensions(monkeypatch):
+    from unittest.mock import AsyncMock
+    import bot
+    from batch_store import BatchStore
+    from vision_client import VisionResult
+
+    store = BatchStore(today_fn=lambda: "2026-11-23")
+    monkeypatch.setattr(bot, "batch_store", store)
+    monkeypatch.setattr(bot, "_allowed", lambda m: True)
+    monkeypatch.setattr(bot, "analyze_photo", AsyncMock(return_value=VisionResult(gender="F", age=27)))
+
+    store.get_or_create(602)
+
+    # 1) MIME image/jpeg
+    m1 = _make_fake_document_message(user_id=602, doc_id="d1", file_name="IMG_4840.JPG", mime_type="image/jpeg")
+    asyncio.run(bot.on_document(m1))
+
+    # 2) Пустой mime_type, но расширение .PNG
+    m2 = _make_fake_document_message(user_id=602, doc_id="d2", file_name="IMG.PNG", mime_type=None)
+    asyncio.run(bot.on_document(m2))
+
+    session = store.get_active(602)
+    assert len(session.photos) == 2
+    assert session.photos[0].is_document is True
+    assert session.photos[0].photo_bytes is not None
+    assert session.photos[1].is_document is True
+    assert session.photos[1].photo_bytes is not None
+
+
+def test_on_document_media_group_batched_once(monkeypatch):
+    from unittest.mock import AsyncMock
+    import bot
+    from batch_store import BatchStore, MediaGroupBuffer
+    from vision_client import VisionResult
+
+    store = BatchStore(today_fn=lambda: "2026-11-23")
+    buf = MediaGroupBuffer(delay=0.01)
+    monkeypatch.setattr(bot, "batch_store", store)
+    monkeypatch.setattr(bot, "media_group_buffer", buf)
+    monkeypatch.setattr(bot, "_allowed", lambda m: True)
+    monkeypatch.setattr(bot, "analyze_photo", AsyncMock(return_value=VisionResult(gender="M", age=33)))
+
+    store.get_or_create(603)
+
+    async def _run():
+        m1 = _make_fake_document_message(user_id=603, doc_id="dg1", file_name="1.jpg", media_group_id="dgrp_1")
+        m2 = _make_fake_document_message(user_id=603, doc_id="dg2", file_name="2.png", media_group_id="dgrp_1")
+        await bot.on_document(m1)
+        await bot.on_document(m2)
+        await asyncio.sleep(0.05)
+        return m1, m2
+
+    m1, m2 = asyncio.run(_run())
+    session = store.get_active(603)
+    assert len(session.photos) == 2
+    assert all(p.is_document for p in session.photos)
+    assert m1.answer.call_count + m2.answer.call_count == 1
+
+
+def test_on_document_rejects_non_image_without_vision_call(monkeypatch):
+    from unittest.mock import AsyncMock
+    import bot
+    from batch_store import BatchStore
+
+    store = BatchStore(today_fn=lambda: "2026-11-23")
+    monkeypatch.setattr(bot, "batch_store", store)
+    monkeypatch.setattr(bot, "_allowed", lambda m: True)
+    vision_mock = AsyncMock()
+    monkeypatch.setattr(bot, "analyze_photo", vision_mock)
+
+    store.get_or_create(604)
+
+    for fname, mime in [
+        ("contract.pdf", "application/pdf"),
+        ("notes.txt", "text/plain"),
+        ("vector.svg", "image/svg+xml"),
+    ]:
+        m = _make_fake_document_message(user_id=604, file_name=fname, mime_type=mime)
+        asyncio.run(bot.on_document(m))
+        assert m.answer.called
+        assert "не является изображением" in m.answer.call_args_list[-1].args[0]
+
+    assert not vision_mock.called
+    assert len(store.get_active(604).photos) == 0
+
+
+def test_send_match_card_document_uses_buffered_input_file():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from aiogram.types import BufferedInputFile
+    import bot
+    from batch_store import PhotoItem
+    from matcher import build_assignment
+
+    rec = _make_record(0, "M", dob="12.03.1975", age=51)
+    ph = PhotoItem(
+        index=0,
+        file_id="doc_file_id_1",
+        file_unique_id="u_doc_1",
+        gender="M",
+        age=50,
+        is_document=True,
+        photo_bytes=b"prepared-jpeg-bytes",
+    )
+    assign = build_assignment(rec, ph, mode="auto")
+
+    fake_bot = SimpleNamespace(send_photo=AsyncMock(return_value=None), send_message=AsyncMock())
+    asyncio.run(bot.send_match_card(fake_bot, 777, rec, ph, assign))
+
+    fake_bot.send_photo.assert_called_once()
+    kwargs = fake_bot.send_photo.call_args.kwargs
+    assert isinstance(kwargs["photo"], BufferedInputFile)
+    assert "FIRST NAME: Person 0" in kwargs["caption"]
+
+
+def test_send_match_card_caches_telegram_photo_file_id_after_send():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from aiogram.types import BufferedInputFile
+    import bot
+    from batch_store import PhotoItem
+    from matcher import build_assignment
+
+    rec = _make_record(0, "M", dob="12.03.1975", age=51)
+    ph = PhotoItem(
+        index=0,
+        file_id="doc_file_id_1",
+        file_unique_id="u_doc_1",
+        gender="M",
+        age=50,
+        is_document=True,
+        photo_bytes=b"prepared-jpeg-bytes",
+    )
+    assign = build_assignment(rec, ph, mode="auto")
+
+    sent_msg = SimpleNamespace(photo=[SimpleNamespace(file_id="cached_tg_photo_id")])
+    fake_bot = SimpleNamespace(send_photo=AsyncMock(return_value=sent_msg), send_message=AsyncMock())
+
+    # Первая отправка: BufferedInputFile + кэширование file_id
+    asyncio.run(bot.send_match_card(fake_bot, 777, rec, ph, assign))
+    assert isinstance(fake_bot.send_photo.call_args_list[0].kwargs["photo"], BufferedInputFile)
+    assert ph.file_id == "cached_tg_photo_id"
+    assert ph.photo_bytes is None
+
+    # Вторая отправка: уже по закэшированному file_id
+    asyncio.run(bot.send_match_card(fake_bot, 777, rec, ph, assign))
+    assert fake_bot.send_photo.call_args_list[1].kwargs["photo"] == "cached_tg_photo_id"
+
+
+def test_showp_document_uses_buffered_input_file(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from aiogram.types import BufferedInputFile
+    import bot
+    from batch_store import BatchStore, PhotoItem
+
+    store = BatchStore(today_fn=lambda: "2026-11-23")
+    monkeypatch.setattr(bot, "batch_store", store)
+    monkeypatch.setattr(bot, "_allowed", lambda m: True)
+
+    session, _, _ = store.get_or_create(605)
+    session.photos.append(
+        PhotoItem(
+            index=0,
+            file_id="doc_file_id_showp",
+            file_unique_id="u_showp",
+            gender="F",
+            age=25,
+            is_document=True,
+            photo_bytes=b"prepared-jpeg-bytes",
+        )
+    )
+
+    cb = SimpleNamespace(
+        data=f"pm:{session.batch_id}:showp",
+        from_user=SimpleNamespace(id=605),
+        message=SimpleNamespace(chat=SimpleNamespace(id=605), answer=AsyncMock(), edit_reply_markup=AsyncMock()),
+        bot=SimpleNamespace(send_photo=AsyncMock(return_value=None), send_message=AsyncMock()),
+        answer=AsyncMock(),
+    )
+    asyncio.run(bot.on_pm_callback(cb))
+
+    cb.bot.send_photo.assert_called_once()
+    assert isinstance(cb.bot.send_photo.call_args.kwargs["photo"], BufferedInputFile)
+
+
+def test_media_group_sends_typing_action_immediately(monkeypatch):
+    from unittest.mock import AsyncMock
+    import bot
+    from batch_store import BatchStore, MediaGroupBuffer
+    from vision_client import VisionResult
+
+    store = BatchStore(today_fn=lambda: "2026-11-23")
+    buf = MediaGroupBuffer(delay=0.02)
+    monkeypatch.setattr(bot, "batch_store", store)
+    monkeypatch.setattr(bot, "media_group_buffer", buf)
+    monkeypatch.setattr(bot, "_allowed", lambda m: True)
+    monkeypatch.setattr(bot, "analyze_photo", AsyncMock(return_value=VisionResult(gender="M", age=30)))
+
+    store.get_or_create(606)
+
+    async def _run():
+        m1 = _make_fake_message(user_id=606, photo_id="t1", media_group_id="tgrp")
+        m2 = _make_fake_message(user_id=606, photo_id="t2", media_group_id="tgrp")
+        await bot.on_photo(m1)
+        # Сразу после первого сообщения (до flush) должен быть вызван typing
+        assert m1.bot.send_chat_action.call_count == 1
+        assert m1.bot.send_chat_action.call_args_list[0].args == (606, "typing")
+        await bot.on_photo(m2)
+        # На втором сообщении спама typing нет
+        assert m2.bot.send_chat_action.call_count == 0
+        await asyncio.sleep(0.05)
+
+    asyncio.run(_run())
 
 
 
