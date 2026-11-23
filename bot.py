@@ -85,9 +85,11 @@ async def on_text(m: Message):
         return
 
     blocks = []
+    # I-01: при нескольких записях не искать DL в общем тексте (он может быть чужим)
+    raw_fallback = text if len(people) == 1 else ""
     for p in people:
         try:
-            blocks.append(await build_block(p, text))
+            blocks.append(await build_block(p, raw_fallback))
         except Exception as e:
             log.exception("build_block failed")
             blocks.append(f"⚠️ Ошибка обработки записи: <code>{type(e).__name__}: {str(e)[:200]}</code>")
