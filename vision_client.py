@@ -10,6 +10,7 @@ from typing import Any, Literal
 from openai import AsyncOpenAI
 
 import config
+from image_utils import InvalidImageError, prepare_image
 
 log = logging.getLogger("vision")
 
@@ -122,6 +123,14 @@ async def _call_once(data_url: str, use_json_format: bool = True) -> str:
 
 
 async def analyze_photo(image_bytes: bytes, mime_type: str = "image/jpeg") -> VisionResult:
+    if len(image_bytes) > 1_500_000 or (mime_type != "image/jpeg" and len(image_bytes) > 512):
+        try:
+            image_bytes = await asyncio.to_thread(prepare_image, image_bytes)
+            mime_type = "image/jpeg"
+        except InvalidImageError as e:
+            log.warning("[vision] invalid image skipped: %s", e)
+            return VisionResult(gender="U", age=None, error="invalid image")
+
     b64 = base64.b64encode(image_bytes).decode("ascii")
     data_url = f"data:{mime_type};base64,{b64}"
 

@@ -5,12 +5,20 @@ import asyncio
 import html
 import io
 import logging
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    Document,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 import config
 from batch_store import (
@@ -22,6 +30,7 @@ from batch_store import (
     PhotoItem,
     calc_age,
 )
+from image_utils import InvalidImageError, prepare_image
 from llm_client import extract_people
 from matcher import build_assignment, match_batch
 from normalizer import build_block, build_block_details, strip_to_clean_blocks
@@ -183,6 +192,20 @@ def format_match_caption(record: MatchRecord, assignment: MatchAssignment) -> tu
     return truncated, record.full_block
 
 
+async def _send_photo_item(bot: Bot, chat_id: int, photo: PhotoItem, caption: str) -> None:
+    media = (
+        BufferedInputFile(photo.photo_bytes, filename="photo.jpg")
+        if photo.photo_bytes is not None
+        else photo.file_id
+    )
+    sent = await bot.send_photo(chat_id, photo=media, caption=caption)
+    if photo.photo_bytes is not None and sent is not None:
+        sent_photos = getattr(sent, "photo", None)
+        if isinstance(sent_photos, (list, tuple)) and len(sent_photos) > 0:
+            photo.file_id = sent_photos[-1].file_id
+            photo.photo_bytes = None
+
+
 async def send_match_card(
     bot: Bot,
     chat_id: int,
@@ -191,7 +214,7 @@ async def send_match_card(
     assignment: MatchAssignment,
 ) -> None:
     caption, overflow_text = format_match_caption(record, assignment)
-    await bot.send_photo(chat_id, photo=photo.file_id, caption=caption)
+    await _send_photo_item(bot, chat_id, photo, caption)
     if overflow_text:
         for chunk in _chunks(overflow_text):
             await bot.send_message(chat_id, chunk)
@@ -331,12 +354,42 @@ async def on_clean_blocks(callback: CallbackQuery):
     await callback.answer()
 
 
-async def _analyze_telegram_photo(bot: Bot, message: Message) -> tuple[str, str, str, int | None, str]:
-    photo_obj = message.photo[-1]
+ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+
+def _is_image_document(doc: Document | None) -> bool:
+    if doc is None:
+        return False
+    mime = (getattr(doc, "mime_type", None) or "").lower().strip()
+    if mime.startswith("image/"):
+        return mime != "image/svg+xml"
+    ext = Path(getattr(doc, "file_name", None) or "").suffix.lower()
+    return ext in ALLOWED_IMAGE_EXTENSIONS
+
+
+async def _analyze_telegram_media(
+    bot: Bot,
+    message: Message,
+) -> tuple[str, str, str, int | None, str, bool, bytes | None]:
+    if message.photo:
+        photo_obj = message.photo[-1]
+        buf = io.BytesIO()
+        await bot.download(photo_obj, destination=buf)
+        res = await analyze_photo(buf.getvalue())
+        return photo_obj.file_id, photo_obj.file_unique_id, res.gender, res.age, res.error, False, None
+
+    doc_obj = message.document
     buf = io.BytesIO()
-    await bot.download(photo_obj, destination=buf)
-    res = await analyze_photo(buf.getvalue())
-    return photo_obj.file_id, photo_obj.file_unique_id, res.gender, res.age, res.error
+    await bot.download(doc_obj, destination=buf)
+    raw_bytes = buf.getvalue()
+    try:
+        prepared_bytes = await asyncio.to_thread(prepare_image, raw_bytes)
+    except InvalidImageError as e:
+        log.warning("Invalid document image %s: %s", getattr(doc_obj, "file_name", None), e)
+        return doc_obj.file_id, doc_obj.file_unique_id, "U", None, "invalid image", True, None
+
+    res = await analyze_photo(prepared_bytes, mime_type="image/jpeg")
+    return doc_obj.file_id, doc_obj.file_unique_id, res.gender, res.age, res.error, True, prepared_bytes
 
 
 async def _flush_media_group(user_id: int, media_group_id: str, batch_id: str, messages: list[Message]) -> None:
@@ -346,10 +399,11 @@ async def _flush_media_group(user_id: int, media_group_id: str, batch_id: str, m
 
     sem = asyncio.Semaphore(3)
     bot = messages[0].bot
+    await bot.send_chat_action(messages[0].chat.id, "typing")
 
     async def _worker(msg: Message):
         async with sem:
-            return await _analyze_telegram_photo(bot, msg)
+            return await _analyze_telegram_media(bot, msg)
 
     results = await asyncio.gather(*(_worker(msg) for msg in messages), return_exceptions=True)
 
@@ -361,7 +415,7 @@ async def _flush_media_group(user_id: int, media_group_id: str, batch_id: str, m
         if isinstance(item, Exception):
             log.warning("media_group photo failed: %s", item)
             continue
-        file_id, file_unique_id, gender, age, err = item
+        file_id, file_unique_id, gender, age, err, is_doc, photo_bytes = item
         session.photos.append(
             PhotoItem(
                 index=len(session.photos),
@@ -370,6 +424,8 @@ async def _flush_media_group(user_id: int, media_group_id: str, batch_id: str, m
                 gender=gender,
                 age=age,
                 vision_error=err,
+                is_document=is_doc,
+                photo_bytes=photo_bytes,
             )
         )
 
@@ -388,17 +444,19 @@ async def on_photo(m: Message):
         return
 
     if m.media_group_id:
-        media_group_buffer.add(
+        is_first = media_group_buffer.add(
             m.from_user.id,
             m.media_group_id,
             session.batch_id,
             m,
             _flush_media_group,
         )
+        if is_first:
+            await m.bot.send_chat_action(m.chat.id, "typing")
         return
 
     await m.bot.send_chat_action(m.chat.id, "typing")
-    file_id, file_unique_id, gender, age, err = await _analyze_telegram_photo(m.bot, m)
+    file_id, file_unique_id, gender, age, err, is_doc, photo_bytes = await _analyze_telegram_media(m.bot, m)
     session.photos.append(
         PhotoItem(
             index=len(session.photos),
@@ -407,6 +465,55 @@ async def on_photo(m: Message):
             gender=gender,
             age=age,
             vision_error=err,
+            is_document=is_doc,
+            photo_bytes=photo_bytes,
+        )
+    )
+    await m.answer(_batch_status_text(session), reply_markup=_match_kb(session))
+
+
+@dp.message(F.document)
+async def on_document(m: Message):
+    if not _allowed(m):
+        await m.answer(f"Нет доступа. Ваш user_id: {m.from_user.id}")
+        return
+
+    session = batch_store.get_active(m.from_user.id)
+    if session is None:
+        await m.answer("Чтобы подбирать фото к строкам, включите режим /match")
+        return
+
+    if not _is_image_document(m.document):
+        fname = html.escape(getattr(m.document, "file_name", None) or "document")
+        await m.answer(
+            f"⚠️ Файл «{fname}» не является изображением. Пришлите фото (JPG, PNG, WEBP, BMP)."
+        )
+        return
+
+    if m.media_group_id:
+        is_first = media_group_buffer.add(
+            m.from_user.id,
+            m.media_group_id,
+            session.batch_id,
+            m,
+            _flush_media_group,
+        )
+        if is_first:
+            await m.bot.send_chat_action(m.chat.id, "typing")
+        return
+
+    await m.bot.send_chat_action(m.chat.id, "typing")
+    file_id, file_unique_id, gender, age, err, is_doc, photo_bytes = await _analyze_telegram_media(m.bot, m)
+    session.photos.append(
+        PhotoItem(
+            index=len(session.photos),
+            file_id=file_id,
+            file_unique_id=file_unique_id,
+            gender=gender,
+            age=age,
+            vision_error=err,
+            is_document=is_doc,
+            photo_bytes=photo_bytes,
         )
     )
     await m.answer(_batch_status_text(session), reply_markup=_match_kb(session))
@@ -453,7 +560,12 @@ async def on_pm_callback(callback: CallbackQuery):
             return
         for p in session.photos:
             age_txt = f"~{p.age} г." if p.age is not None else "? г."
-            await callback.bot.send_photo(chat_id, photo=p.file_id, caption=f"Фото #{p.index + 1} ({p.gender}, {age_txt})")
+            await _send_photo_item(
+                callback.bot,
+                chat_id,
+                p,
+                f"Фото #{p.index + 1} ({p.gender}, {age_txt})",
+            )
         await callback.answer()
         return
 

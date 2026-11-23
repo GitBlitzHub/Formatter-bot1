@@ -27,6 +27,8 @@ class PhotoItem:
     gender: Literal["M", "F", "U"]
     age: int | None
     vision_error: str = ""
+    is_document: bool = False
+    photo_bytes: bytes | None = None
 
 
 @dataclass
@@ -136,14 +138,16 @@ class MediaGroupBuffer:
         batch_id: str,
         message: Any,
         flush_cb: Callable[[int, str, str, list[Any]], Awaitable[None]],
-    ) -> None:
+    ) -> bool:
         key = (user_id, media_group_id)
         entry = self._groups.get(key)
+        is_first = False
         if entry is None or entry.batch_id != batch_id:
             if entry is not None and entry.task and not entry.task.done():
                 entry.task.cancel()
             entry = _GroupEntry(batch_id=batch_id)
             self._groups[key] = entry
+            is_first = True
 
         entry.messages.append(message)
 
@@ -159,6 +163,8 @@ class MediaGroupBuffer:
                 await flush_cb(user_id, media_group_id, batch_id, current.messages)
 
             entry.task = asyncio.create_task(_runner())
+
+        return is_first
 
     def cancel_batch(self, user_id: int, batch_id: str) -> None:
         to_delete = [
