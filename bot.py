@@ -37,6 +37,10 @@ from image_utils import InvalidImageError, prepare_image
 from llm_client import extract_people
 from matcher import build_assignment, match_batch
 from normalizer import build_block, build_block_details, strip_to_clean_blocks
+from photo.crop import crop_uk
+from photo.faces import ModelsUnavailableError, NoFace
+from photo.phone_look import LookSettings, apply_phone_look, load_rgb
+from photo.store import MAX_FILE_BYTES, MAX_QUEUE, PhotoStore, QueuedPhoto
 from vision_client import analyze_photo
 
 logging.basicConfig(
@@ -47,7 +51,9 @@ log = logging.getLogger("bot")
 
 dp = Dispatcher()
 batch_store = BatchStore()
+photo_store = PhotoStore()
 media_group_buffer = MediaGroupBuffer(delay=0.7)
+_cpu_sem = asyncio.Semaphore(2)
 
 HELP = (
     "Привет! Пришли мне любую «кашу» с данными о человеке, я приведу её к формату.\n\n"
@@ -55,6 +61,7 @@ HELP = (
     "Команды:\n"
     "/match — режим пакетного сопоставления строк и фото\n"
     "/match_reset — закрыть/сбросить текущую пачку\n"
+    "/photo — режим обработки и кадрирования фото 35×45\n"
     "/id — узнать свой telegram user_id\n"
     "/help — эта справка"
 )
@@ -73,9 +80,27 @@ def _chunks(text: str, size: int = 3900):
 
 
 BTN_MATCH = "📦 Match"
-BTN_RESET = "🗑 Сброс"
+BTN_PHOTO = "📸 Photo"
 BTN_HELP = "❓ Помощь"
-REPLY_BUTTON_TEXTS = {BTN_MATCH, BTN_RESET, BTN_HELP}
+
+BTN_PHOTO_CROP = "✂️ 35×45 UK DL"
+BTN_PHOTO_LOOK = "📱 Под iPhone"
+BTN_PHOTO_BOTH = "✨ Оба"
+BTN_PHOTO_SETTINGS = "⚙️ Настройки"
+BTN_PHOTO_CLEAR = "🧹 Очистить"
+BTN_PHOTO_BACK = "⬅️ Назад"
+
+REPLY_BUTTON_TEXTS = {
+    BTN_MATCH,
+    BTN_PHOTO,
+    BTN_HELP,
+    BTN_PHOTO_CROP,
+    BTN_PHOTO_LOOK,
+    BTN_PHOTO_BOTH,
+    BTN_PHOTO_SETTINGS,
+    BTN_PHOTO_CLEAR,
+    BTN_PHOTO_BACK,
+}
 
 
 def main_reply_kb() -> ReplyKeyboardMarkup:
@@ -83,7 +108,7 @@ def main_reply_kb() -> ReplyKeyboardMarkup:
         keyboard=[
             [
                 KeyboardButton(text=BTN_MATCH),
-                KeyboardButton(text=BTN_RESET),
+                KeyboardButton(text=BTN_PHOTO),
                 KeyboardButton(text=BTN_HELP),
             ]
         ],
@@ -91,6 +116,20 @@ def main_reply_kb() -> ReplyKeyboardMarkup:
         is_persistent=True,
         one_time_keyboard=False,
         input_field_placeholder="Пришлите данные или фото...",
+    )
+
+
+def photo_reply_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_PHOTO_CROP), KeyboardButton(text=BTN_PHOTO_LOOK)],
+            [KeyboardButton(text=BTN_PHOTO_BOTH), KeyboardButton(text=BTN_PHOTO_SETTINGS)],
+            [KeyboardButton(text=BTN_PHOTO_CLEAR), KeyboardButton(text=BTN_PHOTO_BACK)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Пришлите фото (лучше файлом)...",
     )
 
 
@@ -108,7 +147,41 @@ def _clean_kb() -> InlineKeyboardMarkup:
 def _open_match_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📦 Включить Match", callback_data="pm:open")]
+            [
+                InlineKeyboardButton(text="📦 Включить Match", callback_data="pm:open"),
+                InlineKeyboardButton(text="📸 Режим Photo", callback_data="ph:open"),
+            ]
+        ]
+    )
+
+
+def _photo_queue_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✂️ 35×45", callback_data="ph:crop"),
+                InlineKeyboardButton(text="📱 Под iPhone", callback_data="ph:look"),
+                InlineKeyboardButton(text="✨ Оба", callback_data="ph:both"),
+            ],
+            [InlineKeyboardButton(text="🧹 Очистить", callback_data="ph:clear")],
+        ]
+    )
+
+
+def _photo_settings_kb(look: LookSettings) -> InlineKeyboardMarkup:
+    def _row(key: str, label: str, val: str) -> list[InlineKeyboardButton]:
+        return [
+            InlineKeyboardButton(text="−", callback_data=f"phs:{key}:-"),
+            InlineKeyboardButton(text=f"{label}: {val}", callback_data="phs:noop"),
+            InlineKeyboardButton(text="+", callback_data=f"phs:{key}:+"),
+        ]
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            _row("soft", "Кожа", f"{look.soft:g}%"),
+            _row("paper", "Ватман", f"{look.paper:g}%"),
+            _row("noise", "Шум", f"{look.noise:g}"),
+            [InlineKeyboardButton(text="↩️ По умолчанию", callback_data="phs:reset")],
         ]
     )
 
@@ -162,6 +235,12 @@ def _match_kb(session: BatchSession, include_auto: bool = True) -> InlineKeyboar
         bottom_row.append(
             InlineKeyboardButton(text=f"🖼 Фото ({len(session.photos)})", callback_data=f"pm:{bid}:showp")
         )
+    bottom_row.append(
+        InlineKeyboardButton(
+            text=f"✂️ 35×45: {'Вкл' if session.crop_35x45 else 'Выкл'}",
+            callback_data=f"pm:{bid}:tcrop",
+        )
+    )
     bottom_row.append(
         InlineKeyboardButton(text="🗑 Сброс", callback_data=f"pm:{bid}:reset")
     )
@@ -265,15 +344,70 @@ async def _send_photo_item(bot: Bot, chat_id: int, photo: PhotoItem, caption: st
             photo.photo_bytes = None
 
 
+def _crop_uk_bytes(raw_bytes: bytes):
+    return crop_uk(load_rgb(raw_bytes))
+
+
 async def send_match_card(
     bot: Bot,
     chat_id: int,
     record: MatchRecord,
     photo: PhotoItem,
     assignment: MatchAssignment,
+    crop_35x45: bool = False,
 ) -> None:
-    caption, overflow_text = format_match_caption(record, assignment)
-    await _send_photo_item(bot, chat_id, photo, caption)
+    effective_assign = assignment
+    overflow_text: str | None = None
+
+    if crop_35x45:
+        if photo.cropped_file_id:
+            caption, overflow_text = format_match_caption(record, effective_assign)
+            await bot.send_photo(chat_id, photo=photo.cropped_file_id, caption=caption)
+        elif photo.raw_bytes is not None:
+            try:
+                async with _cpu_sem:
+                    cr = await asyncio.to_thread(_crop_uk_bytes, photo.raw_bytes)
+                caption, overflow_text = format_match_caption(record, effective_assign)
+                sent = await bot.send_photo(
+                    chat_id,
+                    photo=BufferedInputFile(cr.jpeg, filename="crop_35x45.jpg"),
+                    caption=caption,
+                )
+                if sent is not None:
+                    sent_photos = getattr(sent, "photo", None)
+                    if isinstance(sent_photos, (list, tuple)) and len(sent_photos) > 0:
+                        photo.cropped_file_id = sent_photos[-1].file_id
+            except NoFace:
+                note = "35×45: лицо не найдено, отправлено исходное фото."
+                warn = f"{assignment.warning}; {note}" if assignment.warning else note
+                effective_assign = MatchAssignment(
+                    record_index=assignment.record_index,
+                    photo_index=assignment.photo_index,
+                    mode=assignment.mode,
+                    age_diff=assignment.age_diff,
+                    warning=warn,
+                )
+                caption, overflow_text = format_match_caption(record, effective_assign)
+                await _send_photo_item(bot, chat_id, photo, caption)
+            except ModelsUnavailableError:
+                note = "35×45: модели недоступны, отправлено исходное фото."
+                warn = f"{assignment.warning}; {note}" if assignment.warning else note
+                effective_assign = MatchAssignment(
+                    record_index=assignment.record_index,
+                    photo_index=assignment.photo_index,
+                    mode=assignment.mode,
+                    age_diff=assignment.age_diff,
+                    warning=warn,
+                )
+                caption, overflow_text = format_match_caption(record, effective_assign)
+                await _send_photo_item(bot, chat_id, photo, caption)
+        else:
+            caption, overflow_text = format_match_caption(record, effective_assign)
+            await _send_photo_item(bot, chat_id, photo, caption)
+    else:
+        caption, overflow_text = format_match_caption(record, effective_assign)
+        await _send_photo_item(bot, chat_id, photo, caption)
+
     if overflow_text:
         for chunk in _chunks(overflow_text):
             await bot.send_message(chat_id, chunk)
@@ -313,8 +447,26 @@ async def cmd_match(m: Message):
     if not _allowed(m):
         await m.answer(f"Нет доступа. Ваш user_id: {m.from_user.id}")
         return
+    photo_store.exit_photo_mode(m.from_user.id)
     msg, kb = _match_open_text_and_kb(m.from_user.id)
     await m.answer(msg, reply_markup=kb)
+
+
+@dp.message(Command("photo"))
+async def cmd_photo(m: Message):
+    if not _allowed(m):
+        await m.answer(f"Нет доступа. Ваш user_id: {m.from_user.id}")
+        return
+    photo_store.enter_photo_mode(m.from_user.id)
+    await m.answer(
+        "📸 <b>Режим Photo</b>\n\n"
+        "Присылайте фото (лучше <b>файлами</b>, можно альбомом) — они попадут в очередь.\n"
+        "Затем выберите действие кнопками ниже:\n"
+        "• <b>✂️ 35×45 UK DL</b> — кадрирование 827×1063 px (600 dpi)\n"
+        "• <b>📱 Под iPhone</b> — обработка кожи, ватмана и шума\n"
+        "• <b>✨ Оба</b> — сначала обработка под iPhone, затем кадрирование 35×45",
+        reply_markup=photo_reply_kb(),
+    )
 
 
 @dp.message(Command("match_reset", "cancel"))
@@ -341,12 +493,62 @@ async def on_btn_match(m: Message):
     await cmd_match(m)
 
 
-@dp.message(F.text == BTN_RESET)
-async def on_btn_reset(m: Message):
+@dp.message(F.text == BTN_PHOTO)
+async def on_btn_photo(m: Message):
     if not _allowed(m):
         await m.answer(f"Нет доступа. Ваш user_id: {m.from_user.id}")
         return
-    await cmd_match_reset(m)
+    await cmd_photo(m)
+
+
+@dp.message(F.text == BTN_PHOTO_BACK)
+async def on_btn_photo_back(m: Message):
+    if not _allowed(m):
+        await m.answer(f"Нет доступа. Ваш user_id: {m.from_user.id}")
+        return
+    photo_store.exit_photo_mode(m.from_user.id)
+    await m.answer("Возвращаю главное меню.", reply_markup=main_reply_kb())
+
+
+@dp.message(F.text == BTN_PHOTO_CROP)
+async def on_btn_photo_crop(m: Message):
+    if not _allowed(m):
+        await m.answer(f"Нет доступа. Ваш user_id: {m.from_user.id}")
+        return
+    await _run_photo_queue(m.bot, m.chat.id, m.from_user.id, "crop")
+
+
+@dp.message(F.text == BTN_PHOTO_LOOK)
+async def on_btn_photo_look(m: Message):
+    if not _allowed(m):
+        await m.answer(f"Нет доступа. Ваш user_id: {m.from_user.id}")
+        return
+    await _run_photo_queue(m.bot, m.chat.id, m.from_user.id, "look")
+
+
+@dp.message(F.text == BTN_PHOTO_BOTH)
+async def on_btn_photo_both(m: Message):
+    if not _allowed(m):
+        await m.answer(f"Нет доступа. Ваш user_id: {m.from_user.id}")
+        return
+    await _run_photo_queue(m.bot, m.chat.id, m.from_user.id, "both")
+
+
+@dp.message(F.text == BTN_PHOTO_SETTINGS)
+async def on_btn_photo_settings(m: Message):
+    if not _allowed(m):
+        await m.answer(f"Нет доступа. Ваш user_id: {m.from_user.id}")
+        return
+    await _show_photo_settings(m.bot, m.chat.id, m.from_user.id)
+
+
+@dp.message(F.text == BTN_PHOTO_CLEAR)
+async def on_btn_photo_clear(m: Message):
+    if not _allowed(m):
+        await m.answer(f"Нет доступа. Ваш user_id: {m.from_user.id}")
+        return
+    photo_store.clear_queue(m.from_user.id)
+    await m.answer("🧹 Очередь фото очищена.", reply_markup=photo_reply_kb())
 
 
 @dp.message(F.text == BTN_HELP)
@@ -465,13 +667,14 @@ def _is_image_document(doc: Document | None) -> bool:
 async def _analyze_telegram_media(
     bot: Bot,
     message: Message,
-) -> tuple[str, str, str, int | None, str, bool, bytes | None]:
+) -> tuple[str, str, str, int | None, str, bool, bytes | None, bytes | None]:
     if message.photo:
         photo_obj = message.photo[-1]
         buf = io.BytesIO()
         await bot.download(photo_obj, destination=buf)
-        res = await analyze_photo(buf.getvalue())
-        return photo_obj.file_id, photo_obj.file_unique_id, res.gender, res.age, res.error, False, None
+        raw_bytes = buf.getvalue()
+        res = await analyze_photo(raw_bytes)
+        return photo_obj.file_id, photo_obj.file_unique_id, res.gender, res.age, res.error, False, None, raw_bytes
 
     doc_obj = message.document
     buf = io.BytesIO()
@@ -481,10 +684,10 @@ async def _analyze_telegram_media(
         prepared_bytes = await asyncio.to_thread(prepare_image, raw_bytes)
     except InvalidImageError as e:
         log.warning("Invalid document image %s: %s", getattr(doc_obj, "file_name", None), e)
-        return doc_obj.file_id, doc_obj.file_unique_id, "U", None, "invalid image", True, None
+        return doc_obj.file_id, doc_obj.file_unique_id, "U", None, "invalid image", True, None, None
 
     res = await analyze_photo(prepared_bytes, mime_type="image/jpeg")
-    return doc_obj.file_id, doc_obj.file_unique_id, res.gender, res.age, res.error, True, prepared_bytes
+    return doc_obj.file_id, doc_obj.file_unique_id, res.gender, res.age, res.error, True, prepared_bytes, raw_bytes
 
 
 async def _flush_media_group(user_id: int, media_group_id: str, batch_id: str, messages: list[Message]) -> None:
@@ -510,7 +713,7 @@ async def _flush_media_group(user_id: int, media_group_id: str, batch_id: str, m
         if isinstance(item, Exception):
             log.warning("media_group photo failed: %s", item)
             continue
-        file_id, file_unique_id, gender, age, err, is_doc, photo_bytes = item
+        file_id, file_unique_id, gender, age, err, is_doc, photo_bytes, raw_bytes = item
         session.photos.append(
             PhotoItem(
                 index=len(session.photos),
@@ -521,10 +724,223 @@ async def _flush_media_group(user_id: int, media_group_id: str, batch_id: str, m
                 vision_error=err,
                 is_document=is_doc,
                 photo_bytes=photo_bytes,
+                raw_bytes=raw_bytes,
             )
         )
 
     await messages[-1].answer(_batch_status_text(session), reply_markup=_match_kb(session))
+
+
+def _photo_stem(filename: str) -> str:
+    base = Path(filename).stem or "photo"
+    cleaned = "".join(ch for ch in base if ch.isalnum() or ch in "-_")[:60]
+    return cleaned or "photo"
+
+
+def _photo_queue_text(queue: list[QueuedPhoto]) -> str:
+    text = f"📥 В очереди: <b>{len(queue)}</b> фото. Что сделать?"
+    compressed = sum(1 for item in queue if item.compressed)
+    if compressed:
+        text += f"\n⚠️ {compressed} из них пришли сжатыми (как «фото», а не «файл») — качество будет ниже."
+    return text
+
+
+def _photo_settings_text(look: LookSettings) -> str:
+    return (
+        "⚙️ <b>Настройки обработки «Под iPhone»</b>\n\n"
+        f"Кожа (мягкость пор): <b>{look.soft:g}%</b>\n"
+        f"Неровность ватмана: <b>{look.paper:g}%</b>\n"
+        f"Шум матрицы: <b>{look.noise:g}</b>\n\n"
+        "Кадрирование 35×45 эти настройки не использует."
+    )
+
+
+async def _show_photo_settings(bot: Bot, chat_id: int, user_id: int) -> None:
+    look = photo_store.get_settings(user_id)
+    await bot.send_message(
+        chat_id,
+        _photo_settings_text(look),
+        reply_markup=_photo_settings_kb(look),
+    )
+
+
+def _schedule_photo_queue_msg(user_id: int, chat_id: int, bot: Bot) -> None:
+    state = photo_store.get_state(user_id)
+    if state.queue_task and not state.queue_task.done():
+        state.queue_task.cancel()
+
+    async def _show_later() -> None:
+        try:
+            await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            return
+        q = photo_store.get_queue(user_id)
+        if not q:
+            return
+        old_id = state.queue_msg_id
+        state.queue_msg_id = None
+        if old_id:
+            try:
+                await bot.delete_message(chat_id, old_id)
+            except Exception:
+                pass
+        sent = await bot.send_message(chat_id, _photo_queue_text(q), reply_markup=_photo_queue_kb())
+        if sent is not None:
+            state.queue_msg_id = getattr(sent, "message_id", None)
+
+    state.queue_task = asyncio.create_task(_show_later())
+
+
+def _process_photo_sync(data: bytes, action: str, look: LookSettings):
+    im = load_rgb(data)
+    res = apply_phone_look(im, look) if action in ("look", "both") else None
+    cr = crop_uk(load_rgb(res.jpeg) if res else im) if action in ("crop", "both") else None
+    return res, cr
+
+
+async def _run_photo_queue(bot: Bot, chat_id: int, user_id: int, action: str) -> None:
+    items = photo_store.pop_queue(user_id)
+    state = photo_store.get_state(user_id)
+    if state.queue_task and not state.queue_task.done():
+        state.queue_task.cancel()
+    state.queue_task = None
+    old_id = state.queue_msg_id
+    state.queue_msg_id = None
+    if old_id:
+        try:
+            await bot.delete_message(chat_id, old_id)
+        except Exception:
+            pass
+
+    if not items:
+        await bot.send_message(
+            chat_id,
+            "Очередь пуста. Пришлите фото (лучше файлами), затем выберите действие.",
+            reply_markup=photo_reply_kb(),
+        )
+        return
+
+    action_names = {
+        "crop": "Кадрирование 35×45",
+        "look": "Обработка под iPhone",
+        "both": "Обработка и кадрирование 35×45",
+    }
+    action_name = action_names.get(action, action)
+    look = photo_store.get_settings(user_id)
+    status = await bot.send_message(chat_id, f"⏳ {action_name}: {len(items)} фото…")
+
+    results: list[tuple[bytes, str]] = []
+    notes: list[str] = []
+
+    for i, item in enumerate(items, 1):
+        await bot.send_chat_action(chat_id, "upload_document")
+        try:
+            async with _cpu_sem:
+                res, cr = await asyncio.to_thread(_process_photo_sync, item.data, action, look)
+        except NoFace:
+            notes.append(f"№{i} ({item.filename}): не нашёл лицо на фото (нужен портрет анфас).")
+            continue
+        except ModelsUnavailableError:
+            notes.append(f"№{i} ({item.filename}): модели распознавания лиц недоступны на сервере.")
+            continue
+        except Exception:
+            log.exception("photo queue item failed")
+            notes.append(f"№{i} ({item.filename}): не удалось обработать изображение.")
+            continue
+
+        item_notes: list[str] = []
+        if cr is not None:
+            out_bytes = cr.jpeg
+            out_name = f"{_photo_stem(item.filename)}_35x45.jpg"
+            if abs(cr.tilt_deg) >= 0.5:
+                item_notes.append(f"голова выровнена на {abs(cr.tilt_deg):.1f}°")
+            if not cr.crown_found:
+                item_notes.append("верх головы найден приблизительно")
+            if cr.padded:
+                item_notes.append("края кадра достроены фоном")
+        else:
+            out_bytes = res.jpeg
+            out_name = f"{_photo_stem(item.filename)}_studio.jpg"
+            if res.background_share < 0.05:
+                item_notes.append("светлый фон не распознан, неровность ватмана не добавлена")
+
+        if item.compressed:
+            item_notes.append("пришло сжатым")
+        if item_notes:
+            notes.append(f"№{i} ({item.filename}): " + "; ".join(item_notes))
+        results.append((out_bytes, out_name))
+
+    from aiogram.types import InputMediaDocument
+
+    for start in range(0, len(results), 10):
+        chunk = results[start:start + 10]
+        if len(chunk) == 1:
+            await bot.send_document(
+                chat_id,
+                document=BufferedInputFile(chunk[0][0], filename=chunk[0][1]),
+            )
+        else:
+            await bot.send_media_group(
+                chat_id,
+                media=[
+                    InputMediaDocument(media=BufferedInputFile(data, filename=fname))
+                    for data, fname in chunk
+                ],
+            )
+
+    summary = f"✅ {action_name}: готово {len(results)} из {len(items)}."
+    if action in ("crop", "both") and results:
+        summary += "\n35×45 мм, 827×1063 px, 600 dpi. Голова ≈33.0 мм (норма UK 29–34 мм)."
+    if action in ("look", "both"):
+        summary += f"\nНастройки обработки: {look.describe()}."
+    if notes:
+        summary += "\n\nОбратите внимание:\n• " + "\n• ".join(notes)
+
+    if status is not None:
+        try:
+            await status.delete()
+        except Exception:
+            pass
+    await bot.send_message(chat_id, summary, reply_markup=photo_reply_kb())
+
+
+async def _enqueue_photo_for_user(m: Message, is_doc: bool) -> None:
+    user_id = m.from_user.id
+    if len(photo_store.get_queue(user_id)) >= MAX_QUEUE:
+        await m.answer(
+            f"В очереди уже {MAX_QUEUE} фото — это максимум. Сначала обработайте или очистите их.",
+            reply_markup=_photo_queue_kb(),
+        )
+        return
+
+    if is_doc:
+        doc = m.document
+        if getattr(doc, "file_size", None) and doc.file_size > MAX_FILE_BYTES:
+            await m.answer("Файл слишком большой для Telegram-бота (больше 20 МБ).")
+            return
+        buf = io.BytesIO()
+        await m.bot.download(doc, destination=buf)
+        filename = getattr(doc, "file_name", None) or f"photo_{m.message_id}.jpg"
+        compressed = False
+    else:
+        photo_obj = m.photo[-1]
+        buf = io.BytesIO()
+        await m.bot.download(photo_obj, destination=buf)
+        filename = f"photo_{m.message_id}.jpg"
+        compressed = True
+
+    data = buf.getvalue()
+    added = photo_store.add_photo(
+        user_id,
+        QueuedPhoto(filename=filename, data=data, compressed=compressed),
+    )
+    if not added:
+        await m.answer(
+            f"В очереди уже {MAX_QUEUE} фото — это максимум.",
+            reply_markup=_photo_queue_kb(),
+        )
+        return
+    _schedule_photo_queue_msg(user_id, m.chat.id, m.bot)
 
 
 @dp.message(F.photo)
@@ -533,10 +949,14 @@ async def on_photo(m: Message):
         await m.answer(f"Нет доступа. Ваш user_id: {m.from_user.id}")
         return
 
+    if photo_store.is_photo_mode(m.from_user.id):
+        await _enqueue_photo_for_user(m, is_doc=False)
+        return
+
     session = batch_store.get_active(m.from_user.id)
     if session is None:
         await m.answer(
-            "Чтобы подбирать фото к строкам, включите режим /match",
+            "Чтобы подбирать фото к строкам, включите режим /match (или 📸 Photo для кадрирования/обработки).",
             reply_markup=_open_match_kb(),
         )
         return
@@ -554,7 +974,7 @@ async def on_photo(m: Message):
         return
 
     await m.bot.send_chat_action(m.chat.id, "typing")
-    file_id, file_unique_id, gender, age, err, is_doc, photo_bytes = await _analyze_telegram_media(m.bot, m)
+    file_id, file_unique_id, gender, age, err, is_doc, photo_bytes, raw_bytes = await _analyze_telegram_media(m.bot, m)
     session.photos.append(
         PhotoItem(
             index=len(session.photos),
@@ -565,6 +985,7 @@ async def on_photo(m: Message):
             vision_error=err,
             is_document=is_doc,
             photo_bytes=photo_bytes,
+            raw_bytes=raw_bytes,
         )
     )
     await m.answer(_batch_status_text(session), reply_markup=_match_kb(session))
@@ -576,10 +997,20 @@ async def on_document(m: Message):
         await m.answer(f"Нет доступа. Ваш user_id: {m.from_user.id}")
         return
 
+    if photo_store.is_photo_mode(m.from_user.id):
+        if not _is_image_document(m.document):
+            fname = html.escape(getattr(m.document, "file_name", None) or "document")
+            await m.answer(
+                f"⚠️ Файл «{fname}» не является изображением. Пришлите фото (JPG, PNG, WEBP, BMP)."
+            )
+            return
+        await _enqueue_photo_for_user(m, is_doc=True)
+        return
+
     session = batch_store.get_active(m.from_user.id)
     if session is None:
         await m.answer(
-            "Чтобы подбирать фото к строкам, включите режим /match",
+            "Чтобы подбирать фото к строкам, включите режим /match (или 📸 Photo для кадрирования/обработки).",
             reply_markup=_open_match_kb(),
         )
         return
@@ -604,7 +1035,7 @@ async def on_document(m: Message):
         return
 
     await m.bot.send_chat_action(m.chat.id, "typing")
-    file_id, file_unique_id, gender, age, err, is_doc, photo_bytes = await _analyze_telegram_media(m.bot, m)
+    file_id, file_unique_id, gender, age, err, is_doc, photo_bytes, raw_bytes = await _analyze_telegram_media(m.bot, m)
     session.photos.append(
         PhotoItem(
             index=len(session.photos),
@@ -615,9 +1046,81 @@ async def on_document(m: Message):
             vision_error=err,
             is_document=is_doc,
             photo_bytes=photo_bytes,
+            raw_bytes=raw_bytes,
         )
     )
     await m.answer(_batch_status_text(session), reply_markup=_match_kb(session))
+
+
+@dp.callback_query(F.data.startswith("ph:"))
+async def on_ph_callback(callback: CallbackQuery):
+    if not _allowed(callback):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+    action = (callback.data or "").partition(":")[2]
+
+    if action == "open":
+        photo_store.enter_photo_mode(user_id)
+        await callback.message.answer(
+            "📸 Включён режим <b>Photo</b>. Присылайте фото (лучше файлами).",
+            reply_markup=photo_reply_kb(),
+        )
+        await callback.answer()
+        return
+
+    if action == "clear":
+        photo_store.clear_queue(user_id)
+        try:
+            await callback.message.edit_text("🧹 Очередь фото очищена.")
+        except Exception:
+            pass
+        await callback.answer("Очищено")
+        return
+
+    if action in ("crop", "look", "both"):
+        await callback.answer()
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await _run_photo_queue(callback.bot, chat_id, user_id, action)
+        return
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("phs:"))
+async def on_phs_callback(callback: CallbackQuery):
+    if not _allowed(callback):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    rest = (callback.data or "").partition(":")[2]
+    if rest == "noop":
+        await callback.answer()
+        return
+
+    if rest == "reset":
+        look = photo_store.reset_settings(user_id)
+    else:
+        key, _, direction = rest.partition(":")
+        if key not in ("soft", "paper", "noise") or direction not in ("+", "-"):
+            await callback.answer()
+            return
+        look = photo_store.change_setting(user_id, key, direction)
+
+    await callback.answer("Сохранено")
+    try:
+        await callback.message.edit_text(
+            _photo_settings_text(look),
+            reply_markup=_photo_settings_kb(look),
+        )
+    except Exception:
+        pass
 
 
 @dp.callback_query(F.data.startswith("pm:"))
@@ -649,6 +1152,16 @@ async def on_pm_callback(callback: CallbackQuery):
         return
 
     chat_id = callback.message.chat.id
+
+    if action == "tcrop":
+        new_val = not session.crop_35x45
+        batch_store.set_crop_35x45(user_id, new_val)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=_match_kb(session))
+        except Exception:
+            pass
+        await callback.answer(f"Кадрирование 35×45: {'Вкл' if new_val else 'Выкл'}")
+        return
 
     if action == "reset":
         batch_store.reset(user_id)
@@ -693,6 +1206,7 @@ async def on_pm_callback(callback: CallbackQuery):
                 session.records[rec_idx],
                 session.photos[assign.photo_index],
                 assign,
+                crop_35x45=session.crop_35x45,
             )
 
         unmatched = [r for r in session.records if r.index not in session.assignments]
@@ -790,6 +1304,7 @@ async def _setup_bot_commands(bot: Bot) -> None:
     commands = [
         BotCommand(command="match", description="Режим сопоставления фото и строк"),
         BotCommand(command="match_reset", description="Закрыть текущую пачку"),
+        BotCommand(command="photo", description="Режим обработки и кадрирования фото"),
         BotCommand(command="help", description="Справка по работе бота"),
         BotCommand(command="id", description="Узнать свой Telegram user_id"),
     ]
